@@ -47,13 +47,25 @@ def run_daily_pipeline(db, config) -> None:
         db.insert_trade(trade, alerted=is_alerting)
         db.mark_seen(trade["trade_id"])
 
-    # Score and alert qualifying trades
+    # Score qualifying trades; gate on minimum signal strength before alerting
+    min_signal = config.get("min_signal_strength", "weak")   # "strong" | "moderate" | "weak"
+    _signal_rank = {"strong": 3, "moderate": 2, "weak": 1, "unknown": 0}
+    min_rank = _signal_rank.get(min_signal, 1)
+
     alerted_count = 0
     for trade in trades_to_alert:
         stats = db.get_politician_stats(trade.get("politician_name", ""))
         scored_trade = score_trade(trade, stats, config)
-        send_trade_alert(scored_trade, stats, config)
-        alerted_count += 1
+
+        signal = scored_trade.get("signal_strength", "unknown")
+        if _signal_rank.get(signal, 0) >= min_rank:
+            send_trade_alert(scored_trade, stats, config)
+            alerted_count += 1
+        else:
+            logger.info(
+                "Trade %s scored '%s' — below min_signal_strength '%s'; suppressed",
+                trade.get("trade_id"), signal, min_signal,
+            )
 
     logger.info(
         "[Daily Pipeline] Finished — %d total scraped, %d alerted, %d stored silently",
