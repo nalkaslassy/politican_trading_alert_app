@@ -17,6 +17,14 @@ watchlist_politicians:            # used when watchlist_mode is "strict"
 min_trades_for_dynamic: 5         # used when watchlist_mode is "dynamic"
 min_win_rate: 0.60                # used when watchlist_mode is "dynamic"
 
+# --- Scraper ---
+# Pagination stops automatically once the oldest trade on a page is older
+# than max_trade_age_days (set below) — so we always get exactly the right
+# window without a fixed page count.
+# scrape_pages_hard_cap is a safety ceiling to prevent runaway scraping
+# if the site misbehaves; 50 pages ≈ 600 trades, well beyond any 90-day window.
+scrape_pages_hard_cap: 50
+
 # --- Entry-point quality filters ---
 # Keeps alerts actionable: only fire when there is still a reasonable entry.
 # The STOCK Act allows up to 45 days to disclose, so a freshly filed trade

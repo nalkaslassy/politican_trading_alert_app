@@ -35,7 +35,7 @@ def run_daily_pipeline(db, config) -> None:
     """Job 1: Scrape → Filter → Score → Alert pipeline."""
     logger.info("[Daily Pipeline] Started at %s", datetime.now().isoformat())
 
-    trades = fetch_trades()
+    trades = fetch_trades(config)
     logger.info("[Daily Pipeline] Scraped %d trades", len(trades))
 
     trades_to_alert, trades_to_store_only = filter_trades(trades, config, db)
