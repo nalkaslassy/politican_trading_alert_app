@@ -7,8 +7,10 @@ import anthropic
 
 logger = logging.getLogger(__name__)
 
-_MODEL = "claude-haiku-4-5-20251001"
+_MODEL = "claude-sonnet-4-6"
 
+# Prompt cache prefix: static system prompt is sent first so Anthropic can cache it
+# across repeated calls within the same session, saving input tokens.
 _SYSTEM_PROMPT = (
     "You are a financial signal analyst. Analyze congressional stock trades and return "
     "a JSON object only. No preamble, no markdown, just raw JSON."
@@ -22,34 +24,35 @@ _DEFAULT_SCORE = {
 }
 
 
+_RELEVANT_TRADE_FIELDS = (
+    "politician_name", "party", "chamber", "ticker", "trade_type",
+    "trade_size", "trade_date", "_entry_quality", "_move_pct_since_trade",
+    "_price_at_trade", "_current_price",
+)
+
+
 def _build_user_prompt(trade: dict, stats: dict | None) -> str:
-    """Compose the prompt sent to Haiku including trade data and optional stats."""
+    """Build a compact prompt — only send fields the model actually needs."""
+    # Strip internal screener metadata and anything not relevant to scoring
+    clean_trade = {k: v for k, v in trade.items() if k in _RELEVANT_TRADE_FIELDS}
+
     lines = [
-        "Analyze this congressional stock trade and return the JSON exactly as specified.",
-        "",
-        f"Trade details: {json.dumps(trade, default=str)}",
+        f"Congressional trade: {json.dumps(clean_trade, default=str)}",
     ]
 
-    if stats:
-        lines += [
-            "",
-            "Politician track record:",
-            f"  - Win rate (30-day): {stats.get('win_rate_30d', 0.0):.1%}",
-            f"  - Average return (30-day): {stats.get('avg_return_30d', 0.0):.2f}%",
-            f"  - Total tracked buys: {stats.get('total_buys', 0)}",
-        ]
-        if stats.get("win_rate_30d", 0.0) >= 0.70:
-            lines.append("  - NOTE: This politician has a strong historical track record (≥70% win rate).")
+    if stats and stats.get("total_buys", 0) >= 3:
+        win_pct = stats.get("win_rate_30d", 0.0) * 100
+        avg_ret = stats.get("avg_return_30d", 0.0)
+        lines.append(
+            f"Politician stats: {stats['total_buys']} tracked buys, "
+            f"{win_pct:.0f}% 30d win rate, {avg_ret:+.1f}% avg return."
+        )
+        if win_pct >= 70:
+            lines.append("Strong historical track record.")
 
     lines += [
-        "",
-        "Return ONLY this JSON object with no other text:",
-        '{',
-        '  "signal_strength": "strong" | "moderate" | "weak",',
-        '  "sector": "<sector name>",',
-        '  "reasoning": "<one sentence referencing politician track record if stats available>",',
-        '  "watch_out": "<one sentence risk or null>"',
-        '}',
+        'Return ONLY: {"signal_strength":"strong"|"moderate"|"weak",'
+        '"sector":"<sector>","reasoning":"<one sentence>","watch_out":"<one sentence or null>"}',
     ]
     return "\n".join(lines)
 
@@ -97,7 +100,7 @@ def score_trade(trade: dict, stats: dict | None, config: dict) -> dict:
         )
 
     except json.JSONDecodeError as exc:
-        logger.warning("Haiku returned non-JSON for trade %s: %s", trade.get("trade_id"), exc)
+        logger.warning("Sonnet returned non-JSON for trade %s: %s", trade.get("trade_id"), exc)
         trade.update(_DEFAULT_SCORE)
     except Exception as exc:
         logger.warning("Scoring failed for trade %s: %s", trade.get("trade_id"), exc)
