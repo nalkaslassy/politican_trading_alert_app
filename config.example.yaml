@@ -17,5 +17,19 @@ watchlist_politicians:            # used when watchlist_mode is "strict"
 min_trades_for_dynamic: 5         # used when watchlist_mode is "dynamic"
 min_win_rate: 0.60                # used when watchlist_mode is "dynamic"
 
+# --- Entry-point quality filters ---
+# Keeps alerts actionable: only fire when there is still a reasonable entry.
+# The STOCK Act allows up to 45 days to disclose, so a freshly filed trade
+# could be 45 days old — we use 90 days to catch late filers.
+max_trade_age_days: 90            # suppress alerts for trades older than this
+
+# Price-move thresholds (compared to closing price on the politician's trade date):
+#   block  — hard suppress; the opportunity has already fully played out
+#   warn   — still alert, but flag the move so the user can decide
+#   disc   — stock is cheaper than when the politician bought; flag as discount entry
+max_price_move_block: 40.0        # hard block if already up >40%
+max_price_move_warn:  15.0        # caution flag if up 15–40%
+max_price_move_disc: -10.0        # discount-entry flag if down >10% from politician's price
+
 db_path: "./data/capitol_radar.db"
 log_level: "INFO"
