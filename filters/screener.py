@@ -246,7 +246,9 @@ def filter_trades(
 
         valid_ticker = _is_valid_ticker(ticker)
         if not valid_ticker:
-            reasons_blocked.append(f"invalid ticker '{ticker}'")
+            company = trade.get("company_name", "")
+            label   = f"'{company}'" if company else f"ticker='{ticker}'"
+            reasons_blocked.append(f"non-equity instrument {label} (no stock ticker)")
 
         small_size = _is_small_trade(trade_size)
         if small_size:

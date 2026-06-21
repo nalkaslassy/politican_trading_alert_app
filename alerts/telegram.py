@@ -21,9 +21,10 @@ _ENTRY_EMOJI = {
 
 def _format_alert_message(trade: dict, stats: dict | None) -> str:
     """Compose the Telegram HTML alert string for a single trade."""
-    ticker = trade.get("ticker", "N/A")
-    trade_type = trade.get("trade_type", "N/A")
-    politician = trade.get("politician_name", "Unknown")
+    ticker       = trade.get("ticker", "N/A")
+    company_name = trade.get("company_name", "")
+    trade_type   = trade.get("trade_type", "N/A")
+    politician   = trade.get("politician_name", "Unknown")
     party = trade.get("party") or "?"
     chamber = trade.get("chamber") or "?"
     trade_size = trade.get("trade_size", "N/A")
@@ -45,7 +46,7 @@ def _format_alert_message(trade: dict, stats: dict | None) -> str:
     lines = [
         "🏛️ <b>Capitol Radar Signal</b>",
         "",
-        f"📈 <b>{ticker}</b> — {trade_type}",
+        f"📈 <b>{ticker}</b>{f' ({company_name})' if company_name else ''} — {trade_type}",
         f"👤 <b>{politician}</b> ({party} · {chamber})",
         f"💰 Size: {trade_size}  |  🗓 Traded: {trade_date}",
         f"📊 Signal: <b>{signal}</b>",

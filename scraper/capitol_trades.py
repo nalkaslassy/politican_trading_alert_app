@@ -153,15 +153,25 @@ def _scrape_page(driver: webdriver.Remote, page_num: int, first_page: bool) -> l
 
             politician_name, party, chamber = _parse_politician_cell(texts[0])
 
-            # Issuer cell: "Apple Inc\nAAPL:US"
+            # Issuer cell format: "Company Name\nTICKER:US"
+            # Site returns "N/A" as the ticker for bonds, treasuries, and mutual
+            # funds — these are not stocks and have no equity ticker.
             issuer_parts = texts[1].split("\n")
-            ticker_raw = issuer_parts[-1].strip() if len(issuer_parts) > 1 else issuer_parts[0].strip()
+            company_name = issuer_parts[0].strip() if issuer_parts else ""
+            ticker_raw   = issuer_parts[-1].strip() if len(issuer_parts) > 1 else ""
             ticker = _parse_ticker(ticker_raw)
 
-            trade_type   = _normalise_trade_type(texts[6])
-            trade_size   = texts[7]
-            filing_date  = texts[2].replace("\n", " ")   # "PUBLISHED" column
-            trade_date   = texts[3].replace("\n", " ")   # "TRADED" column
+            # Log large non-equity purchases (bonds, treasuries) so they're visible
+            if ticker is None and ticker_raw.upper() == "N/A":
+                logger.debug(
+                    "Non-equity instrument (no ticker): %s — %s %s",
+                    company_name, texts[7], texts[3],
+                )
+
+            trade_type  = _normalise_trade_type(texts[6])
+            trade_size  = texts[7]
+            filing_date = texts[2].replace("\n", " ")   # "PUBLISHED" column
+            trade_date  = texts[3].replace("\n", " ")   # "TRADED" column
 
             source_url = _TRADES_URL
             try:
@@ -172,19 +182,20 @@ def _scrape_page(driver: webdriver.Remote, page_num: int, first_page: bool) -> l
             except Exception:
                 pass
 
-            trade_id = _build_trade_id(politician_name, ticker or ticker_raw or "UNK", trade_date)
+            trade_id = _build_trade_id(politician_name, ticker or company_name or "UNK", trade_date)
             trades.append(
                 {
-                    "trade_id":       trade_id,
+                    "trade_id":        trade_id,
                     "politician_name": politician_name,
-                    "party":          party,
-                    "chamber":        chamber,
-                    "ticker":         ticker,
-                    "trade_type":     trade_type,
-                    "trade_size":     trade_size,
-                    "trade_date":     trade_date,
-                    "filing_date":    filing_date,
-                    "source_url":     source_url,
+                    "party":           party,
+                    "chamber":         chamber,
+                    "company_name":    company_name,
+                    "ticker":          ticker,
+                    "trade_type":      trade_type,
+                    "trade_size":      trade_size,
+                    "trade_date":      trade_date,
+                    "filing_date":     filing_date,
+                    "source_url":      source_url,
                 }
             )
     except Exception as exc:
