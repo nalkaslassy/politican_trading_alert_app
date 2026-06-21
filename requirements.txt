@@ -1,0 +1,8 @@
+anthropic
+python-telegram-bot
+apscheduler
+pyyaml
+requests
+beautifulsoup4
+lxml
+yfinance

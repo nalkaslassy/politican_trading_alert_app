@@ -1,0 +1,21 @@
+anthropic_api_key: ""
+telegram_bot_token: ""
+telegram_chat_id: ""
+telegram_mode: "direct"           # "direct" or "channel"
+
+watchlist_mode: "strict"          # "strict" | "dynamic" | "all"
+watchlist_politicians:            # used when watchlist_mode is "strict"
+  - "Nancy Pelosi"
+  - "Dan Crenshaw"
+  - "Michael McCaul"
+  - "Josh Gottheimer"
+  - "Brian Mast"
+  - "Marjorie Taylor Greene"
+  - "Tommy Tuberville"
+  - "David Rouzer"
+
+min_trades_for_dynamic: 5         # used when watchlist_mode is "dynamic"
+min_win_rate: 0.60                # used when watchlist_mode is "dynamic"
+
+db_path: "./data/capitol_radar.db"
+log_level: "INFO"

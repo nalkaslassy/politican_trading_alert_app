@@ -1,0 +1,17 @@
+version: "3.9"
+
+services:
+  capitol-radar:
+    build: .
+    container_name: capitol-radar
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
+      - ./config.yaml:/app/config.yaml:ro
+    environment:
+      - PYTHONUNBUFFERED=1
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
