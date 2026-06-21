@@ -2,8 +2,10 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install system dependencies for lxml
+# Install Chromium + ChromeDriver + build deps for lxml
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    chromium \
+    chromium-driver \
     gcc \
     libxml2-dev \
     libxslt-dev \

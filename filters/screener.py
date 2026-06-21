@@ -7,9 +7,15 @@ logger = logging.getLogger(__name__)
 
 _SMALL_SIZE_PHRASES = frozenset(
     [
+        # Old capitoltrades.com format
         "under $1,000",
         "$1,001 - $15,000",
         "$1,001-$15,000",
+        # New abbreviated format used by the site (e.g. "1K–15K")
+        "<1k",
+        "1k",
+        "1k–15k",
+        "1k-15k",
     ]
 )
 

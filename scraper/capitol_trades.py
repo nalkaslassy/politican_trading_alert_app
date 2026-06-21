@@ -1,268 +1,328 @@
-"""Scrapes https://www.capitoltrades.com/trades for the latest congressional stock filings."""
+"""Scrapes https://www.capitoltrades.com/trades using a headless Microsoft Edge browser.
 
+Strategy: launch Selenium with Edge headless, navigate to the trades page,
+intercept the XHR/fetch request to bff.capitoltrades.com/trades via the
+browser's performance log, and parse the JSON payload.  This bypasses the
+CloudFront WAF that blocks direct Python requests.
+"""
+
+import json
 import logging
 import re
+import time
 from datetime import date
 
-import requests
-from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.webdriver.edge.options import Options as EdgeOptions
+from selenium.webdriver.edge.service import Service as EdgeService
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.by import By
+from webdriver_manager.microsoft import EdgeChromiumDriverManager
 
 logger = logging.getLogger(__name__)
 
-_BASE_URL = "https://www.capitoltrades.com"
-_TRADES_URL = f"{_BASE_URL}/trades"
-
-_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-}
+_TRADES_URL = "https://www.capitoltrades.com/trades"
+_BFF_BASE = "https://bff.capitoltrades.com"
+_PAGE_LOAD_WAIT = 20       # seconds to wait for the table to appear
+_NETWORK_SETTLE_WAIT = 5   # extra seconds for XHR to complete
 
 
 def _build_trade_id(politician_name: str, ticker: str, trade_date: str) -> str:
     """Construct a unique, deterministic trade identifier."""
     parts = [
-        politician_name.strip().lower().replace(" ", "_"),
+        (politician_name or "unknown").strip().lower().replace(" ", "_"),
         (ticker or "unknown").strip().upper(),
         (trade_date or "nodate").strip(),
     ]
     return "-".join(parts)
 
 
-def _parse_ticker(raw: str) -> str | None:
-    """Extract a 1–5 char uppercase ticker from raw text; return None if invalid."""
+def _parse_ticker(raw: str | None) -> str | None:
+    """Return a 1–5 char uppercase ticker; strip exchange suffix (e.g. 'AAPL:US')."""
     if not raw:
         return None
-    candidate = raw.strip().upper()
+    candidate = raw.split(":")[0].strip().upper()
     if re.match(r"^[A-Z]{1,5}$", candidate):
         return candidate
     return None
 
 
-def _extract_trades_from_table(table, source_url: str) -> list[dict]:
-    """Parse an HTML <table> element and return a list of trade dicts."""
-    trades = []
-    thead = table.find("thead")
-    if not thead:
-        logger.warning("No <thead> found in trades table; skipping")
+def _normalise_trade_type(raw: str) -> str:
+    """Map site trade-type strings to 'Buy' or 'Sell'."""
+    low = (raw or "").lower()
+    if "buy" in low or "purchase" in low:
+        return "Buy"
+    return "Sell"
+
+
+def _parse_bff_trades(data: dict) -> list[dict]:
+    """Convert a BFF /trades JSON payload into a list of canonical trade dicts."""
+    trades: list[dict] = []
+    items = data.get("data", [])
+    if not items:
+        logger.warning("BFF trades response contained no 'data'; keys: %s", list(data.keys()))
         return trades
 
-    header_cells = thead.find_all(["th", "td"])
-    headers = [c.get_text(strip=True).lower() for c in header_cells]
-    logger.debug("Table headers: %s", headers)
+    for item in items:
+        try:
+            politician = item.get("politician") or {}
+            issuer = item.get("issuer") or {}
 
-    tbody = table.find("tbody")
-    if not tbody:
-        logger.warning("No <tbody> found in trades table")
-        return trades
+            politician_name = politician.get("fullName") or politician.get("name", "Unknown")
+            party_raw = (politician.get("party") or "").lower()
+            party_map = {"democrat": "D", "republican": "R", "independent": "I", "d": "D", "r": "R", "i": "I"}
+            party = party_map.get(party_raw, party_raw[:1].upper() or None)
 
-    for row in tbody.find_all("tr"):
-        cells = row.find_all(["td", "th"])
-        if not cells:
+            chamber_raw = (politician.get("chamber") or "").lower()
+            chamber = "House" if "house" in chamber_raw else (
+                "Senate" if "senate" in chamber_raw else None
+            )
+
+            ticker_raw = issuer.get("issuerTicker") or issuer.get("ticker")
+            ticker = _parse_ticker(ticker_raw)
+            trade_type = _normalise_trade_type(item.get("txType") or item.get("type", ""))
+            trade_size = str(item.get("txSize") or item.get("tradeSize") or item.get("size") or "Unknown")
+            trade_date = item.get("txDate") or item.get("tradeDate") or str(date.today())
+            filing_date = item.get("filedDate") or item.get("filingDate") or trade_date
+
+            politician_id = politician.get("_politicianId") or politician.get("id", "")
+            source_url = (
+                f"https://www.capitoltrades.com/politicians/{politician_id}"
+                if politician_id else _TRADES_URL
+            )
+
+            trade_id = _build_trade_id(politician_name, ticker or ticker_raw or "UNK", trade_date)
+            trades.append(
+                {
+                    "trade_id": trade_id,
+                    "politician_name": politician_name,
+                    "party": party,
+                    "chamber": chamber,
+                    "ticker": ticker,
+                    "trade_type": trade_type,
+                    "trade_size": trade_size,
+                    "trade_date": trade_date,
+                    "filing_date": filing_date,
+                    "source_url": source_url,
+                }
+            )
+        except Exception as exc:
+            logger.debug("Skipped item due to parse error: %s", exc)
+
+    return trades
+
+
+def _make_driver() -> webdriver.Remote:
+    """Build a headless WebDriver — tries Chrome first (Linux/Docker), then Edge (Windows)."""
+    common_args = [
+        "--headless=new",
+        "--disable-gpu",
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--window-size=1280,800",
+        "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    ]
+
+    # Try Chrome first (works in Docker/Linux and most environments)
+    try:
+        from selenium.webdriver.chrome.options import Options as ChromeOptions
+        from selenium.webdriver.chrome.service import Service as ChromeService
+        from webdriver_manager.chrome import ChromeDriverManager
+
+        opts = ChromeOptions()
+        for arg in common_args:
+            opts.add_argument(arg)
+        service = ChromeService(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=opts)
+        logger.info("Using Chrome WebDriver")
+        return driver
+    except Exception as chrome_exc:
+        logger.debug("Chrome unavailable (%s); trying Edge", chrome_exc)
+
+    # Fall back to Edge (pre-installed on Windows 11)
+    opts = EdgeOptions()
+    for arg in common_args:
+        opts.add_argument(arg)
+    opts.set_capability("ms:loggingPrefs", {"performance": "ALL"})
+    service = EdgeService(EdgeChromiumDriverManager().install())
+    driver = webdriver.Edge(service=service, options=opts)
+    logger.info("Using Edge WebDriver")
+    return driver
+
+
+def _extract_bff_json_from_logs(driver: webdriver.Edge) -> dict | None:
+    """Scan browser performance logs for a bff.capitoltrades.com/trades response."""
+    try:
+        logs = driver.get_log("performance")
+    except Exception as exc:
+        logger.warning("Could not retrieve performance logs: %s", exc)
+        return None
+
+    for entry in logs:
+        try:
+            msg = json.loads(entry["message"])["message"]
+            if msg.get("method") != "Network.responseReceived":
+                continue
+            url = msg.get("params", {}).get("response", {}).get("url", "")
+            if "bff.capitoltrades.com/trades" not in url:
+                continue
+
+            request_id = msg["params"]["requestId"]
+            result = driver.execute_cdp_cmd(
+                "Network.getResponseBody", {"requestId": request_id}
+            )
+            body_text = result.get("body", "")
+            data = json.loads(body_text)
+            logger.info("Captured BFF /trades response from %s (%d bytes)", url, len(body_text))
+            return data
+        except Exception:
             continue
 
-        def cell_text(idx: int) -> str:
-            """Safely return stripped text for the cell at position idx."""
-            if idx < len(cells):
-                return cells[idx].get_text(separator=" ", strip=True)
-            return ""
+    return None
 
-        # Attempt flexible column mapping by header names first, then fall
-        # back to positional guesses matching the typical capitoltrades layout:
-        # [traded_date, filed_date, politician, party/chamber, ticker, asset, type, size]
-        def find_col(*names: str) -> int:
-            for name in names:
-                for i, h in enumerate(headers):
-                    if name in h:
-                        return i
-            return -1
 
-        traded_col = find_col("traded", "trade date", "date")
-        filed_col = find_col("filed", "filing", "disclosed")
-        politician_col = find_col("politician", "representative", "senator", "name")
-        ticker_col = find_col("ticker", "symbol")
-        type_col = find_col("type", "transaction", "trade type")
-        size_col = find_col("size", "amount", "range", "value")
+def _parse_politician_cell(text: str) -> tuple[str, str | None, str | None]:
+    """Extract (name, party, chamber) from a combined politician cell.
 
-        # Positional fallbacks when headers are ambiguous
-        if traded_col == -1:
-            traded_col = 0
-        if filed_col == -1:
-            filed_col = 1
-        if politician_col == -1:
-            politician_col = 2
-        if ticker_col == -1:
-            ticker_col = 4
-        if type_col == -1:
-            type_col = 6
-        if size_col == -1:
-            size_col = 7
+    Typical format: "Thomas Kean Jr\\nRepublicanHouseNJ"
+    """
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    name = lines[0] if lines else "Unknown"
+    party = None
+    chamber = None
+    if len(lines) > 1:
+        rest = lines[1]  # e.g. "RepublicanHouseNJ"
+        if "republican" in rest.lower():
+            party = "R"
+        elif "democrat" in rest.lower():
+            party = "D"
+        elif "independent" in rest.lower():
+            party = "I"
+        if "house" in rest.lower():
+            chamber = "House"
+        elif "senate" in rest.lower():
+            chamber = "Senate"
+    return name, party, chamber
 
-        politician_raw = cell_text(politician_col)
-        ticker_raw = cell_text(ticker_col)
-        type_raw = cell_text(type_col)
-        size_raw = cell_text(size_col)
-        traded_raw = cell_text(traded_col)
-        filed_raw = cell_col = cell_text(filed_col)
 
-        # Normalise trade type
-        type_norm = "Buy" if "buy" in type_raw.lower() or "purchase" in type_raw.lower() else "Sell"
-        if "sell" in type_raw.lower() or "sale" in type_raw.lower():
-            type_norm = "Sell"
+def _scrape_via_dom(driver: webdriver.Edge) -> list[dict]:
+    """Fallback: parse the rendered DOM table if network logs are unavailable.
 
-        # Parse politician name and party/chamber from combined cells
-        party = None
-        chamber = None
-        politician_name = politician_raw
+    Column layout confirmed from live DOM inspection:
+      [0] Politician (name + party + chamber + state, newline-separated)
+      [1] Issuer (company name + ticker, newline-separated)
+      [2] Published / filing date
+      [3] Traded / trade date
+      [4] Filed after (days)
+      [5] Owner
+      [6] Type (BUY / SELL)
+      [7] Size
+      [8] Price
+      [9] Detail link text
+    """
+    trades: list[dict] = []
+    try:
+        rows = driver.find_elements(By.CSS_SELECTOR, "table tbody tr")
+        logger.info("DOM fallback: found %d table rows", len(rows))
+        for row in rows:
+            cells = row.find_elements(By.TAG_NAME, "td")
+            if len(cells) < 8:
+                continue
+            texts = [c.text.strip() for c in cells]
 
-        # Many sites embed party in a sub-element; try to extract it
-        politician_cell = cells[politician_col] if politician_col < len(cells) else None
-        if politician_cell:
-            party_tag = politician_cell.find(class_=re.compile(r"party|badge", re.I))
-            if party_tag:
-                party_text = party_tag.get_text(strip=True).upper()
-                if party_text in ("D", "R", "I", "L"):
-                    party = party_text
-                politician_name = politician_raw.replace(party_tag.get_text(strip=True), "").strip()
+            politician_name, party, chamber = _parse_politician_cell(texts[0])
 
-        # Chamber heuristics from table or data attributes
-        chamber_tag = row.find(attrs={"data-chamber": True})
-        if chamber_tag:
-            chamber = chamber_tag["data-chamber"].capitalize()
-        else:
-            chamber_cell_text = cell_text(find_col("chamber", "house", "senate") if find_col("chamber", "house", "senate") >= 0 else -1)
-            if "house" in chamber_cell_text.lower():
-                chamber = "House"
-            elif "senate" in chamber_cell_text.lower():
-                chamber = "Senate"
+            # Issuer cell: "Apple Inc\nAAPL:US"
+            issuer_parts = texts[1].split("\n")
+            ticker_raw = issuer_parts[-1].strip() if len(issuer_parts) > 1 else issuer_parts[0].strip()
+            ticker = _parse_ticker(ticker_raw)
 
-        ticker = _parse_ticker(ticker_raw)
-        trade_date = traded_raw.strip()
-        filing_date = filed_raw.strip()
+            trade_type = _normalise_trade_type(texts[6])
+            trade_size = texts[7]
+            filing_date = texts[2].replace("\n", " ")   # "PUBLISHED" column
+            trade_date = texts[3].replace("\n", " ")    # "TRADED" column
 
-        # Build the filing URL if there is a link in the row
-        link_tag = row.find("a", href=True)
-        filing_link = ""
-        if link_tag:
-            href = link_tag["href"]
-            filing_link = href if href.startswith("http") else f"{_BASE_URL}{href}"
-        if not filing_link:
-            filing_link = source_url
+            # Try to extract the detail page URL from the link element in the row
+            source_url = _TRADES_URL
+            try:
+                link = row.find_element(By.TAG_NAME, "a")
+                href = link.get_attribute("href")
+                if href:
+                    source_url = href
+            except Exception:
+                pass
 
-        trade_id = _build_trade_id(politician_name, ticker or ticker_raw, trade_date)
-
-        trades.append(
-            {
-                "trade_id": trade_id,
-                "politician_name": politician_name,
-                "party": party,
-                "chamber": chamber,
-                "ticker": ticker,
-                "trade_type": type_norm,
-                "trade_size": size_raw,
-                "trade_date": trade_date,
-                "filing_date": filing_date,
-                "source_url": filing_link,
-            }
-        )
-
+            trade_id = _build_trade_id(politician_name, ticker or ticker_raw or "UNK", trade_date)
+            trades.append(
+                {
+                    "trade_id": trade_id,
+                    "politician_name": politician_name,
+                    "party": party,
+                    "chamber": chamber,
+                    "ticker": ticker,
+                    "trade_type": trade_type,
+                    "trade_size": trade_size,
+                    "trade_date": trade_date,
+                    "filing_date": filing_date,
+                    "source_url": source_url,
+                }
+            )
+    except Exception as exc:
+        logger.warning("DOM fallback failed: %s", exc)
     return trades
 
 
 def fetch_trades() -> list[dict]:
     """Fetch the latest congressional trades from capitoltrades.com.
 
-    Returns a list of trade dicts.  On any HTTP or parse error, logs a
-    warning and returns an empty list — never raises.
+    Launches a headless Edge browser, navigates to the trades page, and
+    captures the BFF API response.  Falls back to DOM parsing if network
+    log capture fails.  Returns an empty list on unrecoverable errors.
     """
+    driver: webdriver.Edge | None = None
     try:
-        response = requests.get(_TRADES_URL, headers=_HEADERS, timeout=30)
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        logger.warning("HTTP error fetching trades: %s", exc)
-        return []
+        logger.info("Starting headless Edge → %s", _TRADES_URL)
+        driver = _make_driver()
 
-    try:
-        soup = BeautifulSoup(response.text, "lxml")
+        # Enable CDP Network events so we can retrieve response bodies
+        driver.execute_cdp_cmd("Network.enable", {})
+
+        driver.get(_TRADES_URL)
+        logger.info("Page navigation complete; waiting up to %ds for trades table…", _PAGE_LOAD_WAIT)
+
+        # Wait for at least one table row to appear
+        try:
+            WebDriverWait(driver, _PAGE_LOAD_WAIT).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "table tbody tr"))
+            )
+        except Exception:
+            logger.warning("Trades table did not appear within %ds", _PAGE_LOAD_WAIT)
+
+        # Extra settle time for XHR to fully complete
+        time.sleep(_NETWORK_SETTLE_WAIT)
+
+        # Primary: extract JSON from network logs
+        data = _extract_bff_json_from_logs(driver)
+        if data:
+            trades = _parse_bff_trades(data)
+            if trades:
+                logger.info("Extracted %d trades from BFF network log", len(trades))
+                return trades
+
+        # Fallback: parse the DOM table
+        logger.info("Network log capture yielded no trades; falling back to DOM parsing")
+        trades = _scrape_via_dom(driver)
+        logger.info("DOM fallback returned %d trades", len(trades))
+        return trades
+
     except Exception as exc:
-        logger.warning("Failed to parse HTML: %s", exc)
+        logger.warning("fetch_trades encountered an unrecoverable error: %s", exc)
         return []
-
-    trades: list[dict] = []
-
-    # Strategy 1: find a <table> element that looks like a trades table
-    tables = soup.find_all("table")
-    if tables:
-        # Prefer the table with the most rows
-        best_table = max(tables, key=lambda t: len(t.find_all("tr")), default=None)
-        if best_table:
+    finally:
+        if driver:
             try:
-                trades = _extract_trades_from_table(best_table, _TRADES_URL)
-                logger.info("Parsed %d trades from HTML table", len(trades))
-            except Exception as exc:
-                logger.warning("Failed to parse trades table: %s", exc)
-
-    # Strategy 2: fall back to looking for trade cards / list items
-    if not trades:
-        logger.info("No table found; attempting card-based parsing")
-        cards = soup.find_all(
-            ["div", "li", "article"],
-            class_=re.compile(r"trade|filing|disclosure", re.I),
-        )
-        logger.debug("Found %d candidate trade cards", len(cards))
-        for card in cards:
-            try:
-                text = card.get_text(separator=" ", strip=True)
-                ticker_match = re.search(r"\b([A-Z]{1,5})\b", text)
-                ticker = ticker_match.group(1) if ticker_match else None
-
-                date_match = re.search(r"\d{4}-\d{2}-\d{2}", text)
-                trade_date = date_match.group(0) if date_match else str(date.today())
-
-                link_tag = card.find("a", href=True)
-                source = (
-                    link_tag["href"]
-                    if link_tag and link_tag["href"].startswith("http")
-                    else f"{_BASE_URL}{link_tag['href']}" if link_tag else _TRADES_URL
-                )
-
-                type_norm = "Sell"
-                if re.search(r"\bbuy\b|\bpurchase\b", text, re.I):
-                    type_norm = "Buy"
-
-                politician_name = "Unknown"
-                name_match = re.search(r"by ([A-Z][a-z]+ [A-Z][a-z]+)", text)
-                if name_match:
-                    politician_name = name_match.group(1)
-
-                trade_id = _build_trade_id(politician_name, ticker or "UNK", trade_date)
-                trades.append(
-                    {
-                        "trade_id": trade_id,
-                        "politician_name": politician_name,
-                        "party": None,
-                        "chamber": None,
-                        "ticker": ticker,
-                        "trade_type": type_norm,
-                        "trade_size": "",
-                        "trade_date": trade_date,
-                        "filing_date": trade_date,
-                        "source_url": source,
-                    }
-                )
-            except Exception as exc:
-                logger.debug("Skipped card due to parse error: %s", exc)
-
-        if trades:
-            logger.info("Card-based parser found %d trades", len(trades))
-        else:
-            logger.warning("Could not extract any trades from %s", _TRADES_URL)
-
-    return trades
+                driver.quit()
+            except Exception:
+                pass

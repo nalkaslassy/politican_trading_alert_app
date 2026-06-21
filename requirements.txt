@@ -6,3 +6,5 @@ requests
 beautifulsoup4
 lxml
 yfinance
+selenium
+webdriver-manager
