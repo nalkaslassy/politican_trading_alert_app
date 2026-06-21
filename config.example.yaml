@@ -22,7 +22,13 @@ min_win_rate: 0.60                # used when watchlist_mode is "dynamic"
 # "strong" = only highest-conviction calls
 # "moderate" = recommended default — catches real signals, filters noise
 # "weak" = everything passes (not recommended in "all" mode)
-min_signal_strength: "moderate"
+min_signal_strength: "moderate"   # suppress alerts scored below this by Claude
+
+# Diversity controls — prevent one hyperactive trader from flooding alerts
+# A politician filing 6+ trades on the same date is almost certainly doing
+# routine portfolio rebalancing, not making conviction bets.
+max_alerts_per_politician: 3      # max Telegram alerts per politician per run
+bulk_filing_threshold: 6          # same-day trade count that flags rebalancing
 
 # --- Scraper ---
 # Pagination stops automatically once the oldest trade on a page is older
