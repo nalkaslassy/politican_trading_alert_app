@@ -3,6 +3,7 @@
 import sqlite3
 import logging
 from pathlib import Path
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +120,15 @@ class Database:
                     conn.execute(stmt)
                 except Exception:
                     pass  # column already exists
+            conn.executescript("""
+            CREATE TABLE IF NOT EXISTS contractor_cache (
+                ticker TEXT PRIMARY KEY,
+                company_name TEXT,
+                contractor_pts INTEGER DEFAULT 0,
+                contractor_note TEXT DEFAULT '',
+                cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            """)
         logger.info("Database initialised at %s", self.db_path)
 
     # ------------------------------------------------------------------
@@ -186,6 +196,44 @@ class Database:
                 (politician_name, ticker),
             ).fetchone()
         return row[0] if row else 0
+
+    # ------------------------------------------------------------------
+    # Contractor cache
+    # ------------------------------------------------------------------
+
+    def get_contractor_cache(self, ticker: str, ttl_days: int = 7) -> Optional[tuple[int, str]]:
+        """Return cached (contractor_pts, note) if fresh, else None."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT contractor_pts, contractor_note, cached_at "
+                "FROM contractor_cache WHERE ticker = ?",
+                (ticker,),
+            ).fetchone()
+        if row is None:
+            return None
+        from datetime import datetime, timedelta
+        try:
+            cached_at = datetime.fromisoformat(str(row["cached_at"]))
+        except Exception:
+            return None
+        if datetime.now() - cached_at > timedelta(days=ttl_days):
+            return None
+        return row["contractor_pts"], row["contractor_note"] or ""
+
+    def set_contractor_cache(self, ticker: str, company_name: str,
+                              pts: int, note: str) -> None:
+        """Upsert contractor score into cache."""
+        with self._connect() as conn:
+            conn.execute("""
+                INSERT INTO contractor_cache
+                    (ticker, company_name, contractor_pts, contractor_note, cached_at)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(ticker) DO UPDATE SET
+                    company_name     = excluded.company_name,
+                    contractor_pts   = excluded.contractor_pts,
+                    contractor_note  = excluded.contractor_note,
+                    cached_at        = CURRENT_TIMESTAMP
+            """, (ticker, company_name, pts, note))
 
     def get_prior_buy_sell_counts(self, politician_name: str, ticker: str) -> tuple[int, int]:
         """Return (prior_buys, prior_sells) for this politician/ticker pair.

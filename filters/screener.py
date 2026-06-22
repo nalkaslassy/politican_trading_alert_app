@@ -254,16 +254,43 @@ def _compute_disclosure_entry(trade: dict, config: dict) -> tuple[bool, str, dic
         return False, "", meta
 
 
-def _compute_freshness_score(days_since_disclosure: int) -> int:
-    """Return 0–20 pts based on how recently the trade was disclosed.
+def _trading_days_since(filing_date: date) -> int:
+    """Count Mon-Fri business days from the first tradable session after filing.
 
-    Post-disclosure alpha is temporary (Lazzaretto 2024). Fresh disclosures
-    earn the full premium; older ones decay linearly.
+    Weekend filings push the clock to Monday so a Friday-evening disclosure
+    doesn't lose freshness points over the weekend when no one can trade.
+    Falls back to calendar days if numpy is unavailable.
     """
-    if days_since_disclosure <= 2:   return 20
-    if days_since_disclosure <= 7:   return 15
-    if days_since_disclosure <= 14:  return 10
-    if days_since_disclosure <= 21:  return 5
+    wd = filing_date.weekday()   # 0=Mon, 5=Sat, 6=Sun
+    if wd == 5:
+        first_tradable = filing_date + timedelta(days=2)
+    elif wd == 6:
+        first_tradable = filing_date + timedelta(days=1)
+    else:
+        first_tradable = filing_date
+
+    today = date.today()
+    if today <= first_tradable:
+        return 0
+    try:
+        import numpy as np
+        return int(np.busday_count(str(first_tradable), str(today)))
+    except Exception:
+        return (today - first_tradable).days
+
+
+def _compute_freshness_score(trading_days: int) -> int:
+    """Return 0–20 pts based on trading days since first tradable session.
+
+    Bands per ChatGPT review of Lazzaretto 2024 — alpha is temporary
+    post-disclosure; continuous decay avoids calendar-day cliff effects.
+    """
+    if trading_days <= 2:   return 20
+    if trading_days <= 5:   return 18
+    if trading_days <= 10:  return 14
+    if trading_days <= 15:  return 9
+    if trading_days <= 21:  return 5
+    if trading_days <= 30:  return 2
     return 0
 
 
@@ -294,7 +321,7 @@ def _compute_repeat_pts(prior_buys: int, prior_sells: int) -> int:
 
 def _compute_structured_score(trade: dict, basket_score: int, committee_overlap: int,
                                power_score: int, prior_buys: int, prior_sells: int,
-                               freshness_pts: int) -> tuple[int, str]:
+                               freshness_pts: int, contractor_pts: int) -> tuple[int, str]:
     """Compute a 0–100 structured signal score from tabular features.
 
     Does NOT use LLM. Claude receives this score and writes the narrative.
@@ -303,7 +330,8 @@ def _compute_structured_score(trade: dict, basket_score: int, committee_overlap:
       Power/influence           → 0-28 pts  (NBER 2025: formal leadership is the signal)
       Committee/issuer relevance→ 0-30 pts  (Dong & Xu 2025; currently sector-level proxy)
       Disclosure freshness      → 0-20 pts  (Lazzaretto 2024: alpha fades quickly)
-      Repeat-trader pattern     → 0-6 pts   (graduated, not binary)
+      Federal contractor status → 0-12 pts  (NBER 2025: leaders buy firms that get contracts)
+      Repeat-trader pattern     → 0-6 pts   (graduated, direction-aware)
       Owner type                → 0-5 pts   (post-STOCK Act spouse edge is weaker)
       Basket concentration      → 0-5 pts   (tiebreaker only; unvalidated)
 
@@ -316,16 +344,18 @@ def _compute_structured_score(trade: dict, basket_score: int, committee_overlap:
     power_pts     = min(28, power_score)
     committee_pts = min(30, committee_overlap * 10)     # 0, 10, 20, 30
     freshness_pts = min(20, freshness_pts)
+    contract_pts  = min(12, contractor_pts)
     repeat_pts    = _compute_repeat_pts(prior_buys, prior_sells)
     owner_weight  = _OWNER_WEIGHT.get(owner_type, 1)
     owner_pts     = {3: 5, 2: 3, 1: 1, 0: 1}.get(owner_weight, 1)
     basket_pts    = {0: 5, 1: 3, 2: 1, 3: 0}.get(basket_score, 0)
 
-    total = power_pts + committee_pts + freshness_pts + repeat_pts + owner_pts + basket_pts
+    total = (power_pts + committee_pts + freshness_pts + contract_pts
+             + repeat_pts + owner_pts + basket_pts)
 
     breakdown = (
         f"power={power_pts} committee={committee_pts} fresh={freshness_pts} "
-        f"repeat={repeat_pts} owner={owner_pts} basket={basket_pts}"
+        f"contractor={contract_pts} repeat={repeat_pts} owner={owner_pts} basket={basket_pts}"
     )
     return min(100, total), breakdown
 
@@ -422,9 +452,9 @@ def filter_trades(
 
         pol_name = trade.get("politician_name", "")
 
-        # Freshness score — days since filing_date (already within max_disc_age at this point)
-        days_since_disc = (date.today() - filing_dt).days if filing_dt else 14
-        freshness_pts   = _compute_freshness_score(days_since_disc)
+        # Freshness score — trading days since first tradable session after disclosure
+        trading_days  = _trading_days_since(filing_dt) if filing_dt else 14
+        freshness_pts = _compute_freshness_score(trading_days)
 
         # Power/influence score (Hall-Karadas-Schlosky, NBER 2025)
         try:
@@ -446,6 +476,18 @@ def filter_trades(
         except Exception:
             prior_buys, prior_sells = 0, 0
 
+        # Contractor score — USAspending federal contract exposure (cached 7 days)
+        try:
+            from filters.contractor_score import get_contractor_score
+            contractor_pts, contractor_note = get_contractor_score(
+                trade.get("company_name", ""),
+                ticker,
+                cache_get=db.get_contractor_cache,
+                cache_set=db.set_contractor_cache,
+            )
+        except Exception:
+            contractor_pts, contractor_note = 0, ""
+
         # Relative size (kept for display/DB only — not used in score per Belmont 2022)
         history  = db.get_politician_trade_history(pol_name)
         rel_size = _compute_relative_size_score(trade, history)
@@ -455,7 +497,7 @@ def filter_trades(
 
         structured_score, score_breakdown = _compute_structured_score(
             trade, basket_score, committee_overlap, power_score,
-            prior_buys, prior_sells, freshness_pts
+            prior_buys, prior_sells, freshness_pts, contractor_pts
         )
         signal_strength = _score_to_strength(
             structured_score, basket_score, power_pts, committee_pts, freshness_pts
@@ -471,6 +513,8 @@ def filter_trades(
         trade["_prior_buys"]          = prior_buys
         trade["_prior_sells"]         = prior_sells
         trade["_freshness_pts"]       = freshness_pts
+        trade["_contractor_pts"]      = contractor_pts
+        trade["_contractor_note"]     = contractor_note
         trade["_structured_score"]    = structured_score
         trade["_score_breakdown"]     = score_breakdown
         trade["signal_strength"]      = signal_strength
