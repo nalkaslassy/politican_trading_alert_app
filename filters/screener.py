@@ -254,19 +254,46 @@ def _compute_disclosure_entry(trade: dict, config: dict) -> tuple[bool, str, dic
         return False, "", meta
 
 
-def _compute_structured_score(trade: dict, basket_score: int,
-                               committee_overlap: int, power_score: int,
-                               repeat_trader: bool) -> tuple[int, str]:
+def _compute_freshness_score(days_since_disclosure: int) -> int:
+    """Return 0–20 pts based on how recently the trade was disclosed.
+
+    Post-disclosure alpha is temporary (Lazzaretto 2024). Fresh disclosures
+    earn the full premium; older ones decay linearly.
+    """
+    if days_since_disclosure <= 2:   return 20
+    if days_since_disclosure <= 7:   return 15
+    if days_since_disclosure <= 14:  return 10
+    if days_since_disclosure <= 21:  return 5
+    return 0
+
+
+def _compute_repeat_pts(prior_count: int) -> int:
+    """Return 0–6 pts for repeated same-ticker trading (Lazzaretto 2024).
+
+    Graduated rather than binary: frequency alone doesn't prove conviction;
+    just 1 prior trade is weak evidence, 4+ is a clearer pattern.
+    Capped at 6 (not 10) because direction-awareness is unavailable.
+    """
+    if prior_count == 0:   return 0
+    if prior_count == 1:   return 2
+    if prior_count <= 3:   return 5
+    return 6
+
+
+def _compute_structured_score(trade: dict, basket_score: int, committee_overlap: int,
+                               power_score: int, repeat_count: int,
+                               freshness_pts: int) -> tuple[int, str]:
     """Compute a 0–100 structured signal score from tabular features.
 
     Does NOT use LLM. Claude receives this score and writes the narrative.
 
-    Weights (research-informed, updated per Belmont 2022 / NBER 2025):
-      Power/influence           → 0-35 pts  (strongest modern signal — NBER 2025 leadership paper)
-      Committee overlap (0-3)  → 0-25 pts  (direct jurisdiction per Dong & Xu 2025)
-      Owner type                → 0-20 pts  (spouse > self per Karadas 2019)
-      Basket score (inverted)  → 0-10 pts  (concentration; unvalidated but intuitive)
-      Repeat-trader bonus       → 0-10 pts  (repeated same-stock trades per Lazzaretto 2024)
+    Weights (research-informed, calibrated per ChatGPT review of literature):
+      Power/influence           → 0-28 pts  (NBER 2025: formal leadership is the signal)
+      Committee/issuer relevance→ 0-30 pts  (Dong & Xu 2025; currently sector-level proxy)
+      Disclosure freshness      → 0-20 pts  (Lazzaretto 2024: alpha fades quickly)
+      Repeat-trader pattern     → 0-6 pts   (graduated, not binary)
+      Owner type                → 0-5 pts   (post-STOCK Act spouse edge is weaker)
+      Basket concentration      → 0-5 pts   (tiebreaker only; unvalidated)
 
     Removed (per Belmont 2022 — larger trades underperform post-STOCK Act):
       Trade size                → 0 pts
@@ -274,29 +301,43 @@ def _compute_structured_score(trade: dict, basket_score: int,
     """
     owner_type = trade.get("owner_type", "Unknown")
 
-    power_pts     = min(35, power_score)
-    committee_pts = min(25, committee_overlap * 8)      # 0, 8, 16, or 24 → cap 25
-    owner_pts     = {3: 20, 2: 15, 1: 5, 0: 5}.get(_OWNER_WEIGHT.get(owner_type, 1), 5)
-    basket_pts    = max(0, (3 - basket_score)) * 3      # 0, 3, 6, or 9
-    repeat_pts    = 10 if repeat_trader else 0
+    power_pts     = min(28, power_score)
+    committee_pts = min(30, committee_overlap * 10)     # 0, 10, 20, 30
+    freshness_pts = min(20, freshness_pts)
+    repeat_pts    = _compute_repeat_pts(repeat_count)
+    owner_weight  = _OWNER_WEIGHT.get(owner_type, 1)
+    owner_pts     = {3: 5, 2: 3, 1: 1, 0: 1}.get(owner_weight, 1)
+    basket_pts    = {0: 5, 1: 3, 2: 1, 3: 0}.get(basket_score, 0)
 
-    total = power_pts + committee_pts + owner_pts + basket_pts + repeat_pts
+    total = power_pts + committee_pts + freshness_pts + repeat_pts + owner_pts + basket_pts
 
     breakdown = (
-        f"power={power_pts} committee={committee_pts} owner={owner_pts} "
-        f"concentration={basket_pts} repeat={repeat_pts}"
+        f"power={power_pts} committee={committee_pts} fresh={freshness_pts} "
+        f"repeat={repeat_pts} owner={owner_pts} basket={basket_pts}"
     )
     return min(100, total), breakdown
 
 
-def _score_to_strength(score: int, basket_score: int) -> str:
-    """Map structured score to signal_strength label."""
+def _score_to_strength(score: int, basket_score: int,
+                       power_pts: int, committee_pts: int, freshness_pts: int) -> str:
+    """Map structured score to signal_strength using mandatory gates.
+
+    A high total score built from weak proxy factors (no power, no committee
+    relevance, stale disclosure) must not become 'strong'. Each tier requires
+    minimum values in the three independent evidence dimensions.
+    """
     if basket_score >= 3:
-        return "weak"      # broad basket always weak regardless of score
-    if score >= 55:
+        return "weak"   # broad portfolio event — not a conviction signal
+
+    if (score >= 65
+            and power_pts >= 10
+            and committee_pts >= 10
+            and freshness_pts >= 10):
         return "strong"
-    if score >= 35:
+
+    if score >= 45 and (power_pts >= 8 or committee_pts >= 12):
         return "moderate"
+
     return "weak"
 
 
@@ -370,12 +411,16 @@ def filter_trades(
 
         pol_name = trade.get("politician_name", "")
 
+        # Freshness score — days since filing_date (already within max_disc_age at this point)
+        days_since_disc = (date.today() - filing_dt).days if filing_dt else 14
+        freshness_pts   = _compute_freshness_score(days_since_disc)
+
         # Power/influence score (Hall-Karadas-Schlosky, NBER 2025)
         try:
             from filters.power_score import get_power_score
             power_score, power_note = get_power_score(pol_name)
         except Exception:
-            power_score, power_note = 5, ""
+            power_score, power_note = 3, ""
 
         # Committee overlap (may do yfinance sector lookup)
         try:
@@ -384,21 +429,25 @@ def filter_trades(
         except Exception:
             committee_overlap, committee_note = 0, ""
 
-        # Repeat-trader bonus (Lazzaretto 2024: repeated same-stock trades are speculative signals)
+        # Repeat-trader pattern (Lazzaretto 2024: graduated, not binary)
         try:
-            repeat_count  = db.get_prior_trade_count(pol_name, ticker)
-            repeat_trader = repeat_count > 0
+            repeat_count = db.get_prior_trade_count(pol_name, ticker)
         except Exception:
-            repeat_trader = False
+            repeat_count = 0
 
         # Relative size (kept for display/DB only — not used in score per Belmont 2022)
         history  = db.get_politician_trade_history(pol_name)
         rel_size = _compute_relative_size_score(trade, history)
 
+        power_pts     = min(28, power_score)
+        committee_pts = min(30, committee_overlap * 10)
+
         structured_score, score_breakdown = _compute_structured_score(
-            trade, basket_score, committee_overlap, power_score, repeat_trader
+            trade, basket_score, committee_overlap, power_score, repeat_count, freshness_pts
         )
-        signal_strength = _score_to_strength(structured_score, basket_score)
+        signal_strength = _score_to_strength(
+            structured_score, basket_score, power_pts, committee_pts, freshness_pts
+        )
 
         # Attach computed features to trade dict for scorer and alert formatter
         trade["_basket_score"]        = basket_score
@@ -407,7 +456,8 @@ def filter_trades(
         trade["_committee_note"]      = committee_note
         trade["_power_score"]         = power_score
         trade["_power_note"]          = power_note
-        trade["_repeat_trader"]       = repeat_trader
+        trade["_repeat_count"]        = repeat_count
+        trade["_freshness_pts"]       = freshness_pts
         trade["_structured_score"]    = structured_score
         trade["_score_breakdown"]     = score_breakdown
         trade["signal_strength"]      = signal_strength
