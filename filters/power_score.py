@@ -50,15 +50,18 @@ _POWER_SCORES: dict[str, int] = {
     # ── Ranking members ────────────────────────────────────────────────────
     "Debbie Wasserman Schultz": 10,   # Ranking, House Appropriations subcommittee
 
-    # ── Former formal leadership (still influential through networks) ──────
-    "Nancy Pelosi":             10,   # Former Speaker
-    "Mitch McConnell":          10,   # Former Senate Majority Leader
-    "Kevin McCarthy":           10,   # Former Speaker (resigned Dec 2023)
+    # ── Still serving, former formal leadership ───────────────────────────
+    # NBER 2025 paper is about *current* agenda-setting power. Experimental
+    # 3 pts for network/institutional influence that may persist post-role.
+    "Nancy Pelosi":              3,   # Former Speaker, still serving
+    "Mitch McConnell":           3,   # Former Senate Majority Leader, still serving
 
-    # ── Former committee chairs ────────────────────────────────────────────
-    "Patrick McHenry":           8,   # Former Chair, House Financial Services
-    "Richard Burr":              8,   # Former Chair, Senate Intelligence
-    "Richard Shelby":            8,   # Former Chair, Senate Appropriations
+    # ── No longer serving — score zero ────────────────────────────────────
+    # Kevin McCarthy resigned Dec 2023; former chairs retired.
+    "Kevin McCarthy":            0,
+    "Patrick McHenry":           0,
+    "Richard Burr":              0,
+    "Richard Shelby":            0,
 
     # NOTE: All regular committee members and unknown roles score 0.
     # Seniority without formal agenda-setting power has no validated alpha.

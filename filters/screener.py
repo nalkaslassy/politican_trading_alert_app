@@ -290,8 +290,7 @@ def _compute_freshness_score(trading_days: int) -> int:
     if trading_days <= 10:  return 14
     if trading_days <= 15:  return 9
     if trading_days <= 21:  return 5
-    if trading_days <= 30:  return 2
-    return 0
+    return 0   # staleness gate at 21 td makes this unreachable in practice
 
 
 def _compute_repeat_pts(prior_buys: int, prior_sells: int) -> int:
@@ -342,7 +341,7 @@ def _compute_structured_score(trade: dict, basket_score: int, committee_overlap:
     owner_type = trade.get("owner_type", "Unknown")
 
     power_pts     = min(28, power_score)
-    committee_pts = min(30, committee_overlap * 10)     # 0, 10, 20, 30
+    committee_pts = min(15, committee_overlap * 5)      # 0, 5, 10, 15 — GICS proxy only
     freshness_pts = min(20, freshness_pts)
     contract_pts  = min(12, contractor_pts)
     repeat_pts    = _compute_repeat_pts(prior_buys, prior_sells)
@@ -350,6 +349,7 @@ def _compute_structured_score(trade: dict, basket_score: int, committee_overlap:
     owner_pts     = {3: 5, 2: 3, 1: 1, 0: 1}.get(owner_weight, 1)
     basket_pts    = {0: 5, 1: 3, 2: 1, 3: 0}.get(basket_score, 0)
 
+    # No cap — raw max is 91. Thresholds (45/65) are absolute, not percentages.
     total = (power_pts + committee_pts + freshness_pts + contract_pts
              + repeat_pts + owner_pts + basket_pts)
 
@@ -357,26 +357,36 @@ def _compute_structured_score(trade: dict, basket_score: int, committee_overlap:
         f"power={power_pts} committee={committee_pts} fresh={freshness_pts} "
         f"contractor={contract_pts} repeat={repeat_pts} owner={owner_pts} basket={basket_pts}"
     )
-    return min(100, total), breakdown
+    return total, breakdown
 
 
 def _score_to_strength(score: int, basket_score: int,
                        power_pts: int, committee_pts: int, freshness_pts: int) -> str:
-    """Map structured score to signal_strength using mandatory gates.
+    """Map structured score to signal_strength tier.
 
-    A high total score built from weak proxy factors (no power, no committee
-    relevance, stale disclosure) must not become 'strong'. Each tier requires
-    minimum values in the three independent evidence dimensions.
+    Tiers:
+      strong       — 65+ AND top leadership (power≥22). GICS proxy cannot
+                     substitute for verified political influence. Per NBER 2025
+                     and Belmont 2022, only formal leaders show reliable alpha.
+      high_moderate— 65+ but without top leadership. Score is high but built on
+                     proxy factors (sector overlap, contractor status). Interesting
+                     but unverified at issuer-specific level.
+      moderate     — 45–64 with meaningful power or committee relevance.
+      weak         — everything else.
     """
     if basket_score >= 3:
         return "weak"   # broad portfolio event — not a conviction signal
 
-    if (score >= 65
-            and freshness_pts >= 10
-            and (committee_pts >= 10 or power_pts >= 22)):
+    if freshness_pts < 10:
+        return "weak"   # too stale regardless of other scores
+
+    if score >= 65 and power_pts >= 22:
         return "strong"
 
-    if score >= 45 and (power_pts >= 8 or committee_pts >= 12):
+    if score >= 65:
+        return "high_moderate"   # high score, but no verified leadership signal
+
+    if score >= 45 and (power_pts >= 8 or committee_pts >= 10):
         return "moderate"
 
     return "weak"
@@ -434,14 +444,14 @@ def filter_trades(
             store_only.append(trade)
             continue
 
-        # Disclosure staleness gate — filing_date within max_days_since_disclosure
-        # Alpha accrues quickly after disclosure and fades; stale filings are dead signals.
-        max_disc_age = int(config.get("max_days_since_disclosure", 21))
-        filing_dt    = _parse_trade_date(trade.get("filing_date", ""))
-        if filing_dt and (date.today() - filing_dt).days > max_disc_age:
+        # Disclosure staleness gate — filing_date within max_trading_days_since_disclosure
+        # Using trading days (not calendar days) matches the freshness score clock.
+        max_disc_td = int(config.get("max_trading_days_since_disclosure", 21))
+        filing_dt   = _parse_trade_date(trade.get("filing_date", ""))
+        if filing_dt and _trading_days_since(filing_dt) > max_disc_td:
             logger.debug(
-                "Trade %s → store-only (disclosure %dd old, limit %d)",
-                trade_id, (date.today() - filing_dt).days, max_disc_age,
+                "Trade %s → store-only (disclosure %d trading-days old, limit %d td)",
+                trade_id, _trading_days_since(filing_dt), max_disc_td,
             )
             store_only.append(trade)
             continue
@@ -493,7 +503,7 @@ def filter_trades(
         rel_size = _compute_relative_size_score(trade, history)
 
         power_pts     = min(28, power_score)
-        committee_pts = min(30, committee_overlap * 10)
+        committee_pts = min(15, committee_overlap * 5)
 
         structured_score, score_breakdown = _compute_structured_score(
             trade, basket_score, committee_overlap, power_score,

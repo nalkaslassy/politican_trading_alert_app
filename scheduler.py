@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 _TZ = "America/New_York"
 
-_SIGNAL_RANK = {"strong": 3, "moderate": 2, "weak": 1, "unknown": 0}
+_SIGNAL_RANK = {"strong": 3, "high_moderate": 2, "moderate": 2, "weak": 1, "unknown": 0}
 
 _SIZE_RANK = {
     "1m":   7, "500k": 6, "250k": 5, "100k": 4,

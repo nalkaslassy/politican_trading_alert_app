@@ -235,18 +235,22 @@ class Database:
                     cached_at        = CURRENT_TIMESTAMP
             """, (ticker, company_name, pts, note))
 
-    def get_prior_buy_sell_counts(self, politician_name: str, ticker: str) -> tuple[int, int]:
-        """Return (prior_buys, prior_sells) for this politician/ticker pair.
+    def get_prior_buy_sell_counts(self, politician_name: str, ticker: str,
+                                   lookback_days: int = 365) -> tuple[int, int]:
+        """Return (prior_buys, prior_sells) within the lookback window.
 
-        Used for direction-aware repeat scoring (Lazzaretto 2024): repeated
-        same-direction buys signal conviction; alternating buys and sells
-        suggest routine two-way trading rather than informed accumulation.
+        Uses a rolling 365-day window so an old sale years ago does not
+        permanently penalise a current accumulation sequence. Direction-aware
+        repeat scoring per Lazzaretto 2024.
         """
+        from datetime import date, timedelta
+        cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT trade_type, COUNT(*) as cnt FROM all_trades "
-                "WHERE politician_name = ? AND ticker = ? GROUP BY trade_type",
-                (politician_name, ticker),
+                "WHERE politician_name = ? AND ticker = ? AND trade_date >= ? "
+                "GROUP BY trade_type",
+                (politician_name, ticker, cutoff),
             ).fetchall()
         counts = {r["trade_type"]: r["cnt"] for r in rows}
         return counts.get("Buy", 0), counts.get("Sell", 0)
