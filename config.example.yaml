@@ -3,7 +3,7 @@ telegram_bot_token: ""
 telegram_chat_id: ""
 telegram_mode: "direct"           # "direct" or "channel"
 
-watchlist_mode: "strict"          # "strict" | "dynamic" | "all"
+watchlist_mode: "all"             # "strict" | "dynamic" | "all"
 watchlist_politicians:            # used when watchlist_mode is "strict"
   - "Nancy Pelosi"
   - "Dan Crenshaw"
@@ -17,40 +17,38 @@ watchlist_politicians:            # used when watchlist_mode is "strict"
 min_trades_for_dynamic: 5         # used when watchlist_mode is "dynamic"
 min_win_rate: 0.60                # used when watchlist_mode is "dynamic"
 
-# Signal strength gate — only alert on trades at or above this score.
-# Especially important in "all" mode to avoid noise from the full congress.
-# "strong" = only highest-conviction calls
-# "moderate" = recommended default — catches real signals, filters noise
-# "weak" = everything passes (not recommended in "all" mode)
-min_signal_strength: "moderate"   # suppress alerts scored below this by Claude
+# Signal strength gate — structured score determines signal_strength.
+# Claude writes narrative only; algorithmic score gates alerts.
+# "strong" (score ≥55) = highest-conviction: committee overlap + concentrated + large
+# "moderate" (score ≥35) = recommended default — catches real signals, filters noise
+# "weak" (<35) = everything passes (not recommended in "all" mode)
+min_signal_strength: "moderate"
 
-# Diversity controls — prevent one hyperactive trader from flooding alerts
-# A politician filing 6+ trades on the same date is almost certainly doing
-# routine portfolio rebalancing, not making conviction bets.
+# Diversity controls — prevent one politician from flooding alerts
 max_alerts_per_politician: 3      # max Telegram alerts per politician per run
-bulk_filing_threshold: 6          # same-day trade count that flags rebalancing
 
 # --- Scraper ---
-# Pagination stops automatically once the oldest trade on a page is older
-# than max_trade_age_days (set below) — so we always get exactly the right
-# window without a fixed page count.
-# scrape_pages_hard_cap is a safety ceiling to prevent runaway scraping
-# if the site misbehaves; 50 pages ≈ 600 trades, well beyond any 90-day window.
 scrape_pages_hard_cap: 50
+max_trade_age_days: 90
 
-# --- Entry-point quality filters ---
-# Keeps alerts actionable: only fire when there is still a reasonable entry.
-# The STOCK Act allows up to 45 days to disclose, so a freshly filed trade
-# could be 45 days old — we use 90 days to catch late filers.
-max_trade_age_days: 90            # suppress alerts for trades older than this
+# --- Entry point (DISCLOSURE DATE clock, ATR-normalised) ---
+# Lazzaretto (2024): alpha accrues from disclosure, not from execution date.
+# Blocks are expressed in ATR multiples — volatile stocks aren't unfairly penalised.
+#
+#  entry_block_atr_multiple   — hard block if stock moved > N ATR since disclosure
+#  entry_caution_atr_multiple — caution flag if moved > N ATR (still alerts)
+#  max_price_move_disc        — "discount entry" flag if stock fell > this % since disclosure
+max_days_since_disclosure:  21    # suppress alerts for disclosures filed more than 21 days ago
+                                  # (alpha window is tight post-disclosure; stale filings add noise)
+entry_block_atr_multiple:   3.0   # block if +3 ATR since disclosure (opportunity passed)
+entry_caution_atr_multiple: 1.5   # caution if +1.5 ATR (confirm thesis still valid)
+max_price_move_disc: -10.0        # discount-entry if down >10% since disclosure
 
-# Price-move thresholds (compared to closing price on the politician's trade date):
-#   block  — hard suppress; the opportunity has already fully played out
-#   warn   — still alert, but flag the move so the user can decide
-#   disc   — stock is cheaper than when the politician bought; flag as discount entry
-max_price_move_block: 40.0        # hard block if already up >40%
-max_price_move_warn:  15.0        # caution flag if up 15–40%
-max_price_move_disc: -10.0        # discount-entry flag if down >10% from politician's price
+# --- Trade size filter ---
+# min_size_band: minimum numeric band (0-7 scale) to pass the filter.
+#   0 = all trades, 1 = $1K+, 2 = $15K+ (default), 3 = $50K+, 4 = $100K+
+# Relative size scoring (vs politician's own history) happens separately in the score.
+min_size_band: 2
 
 db_path: "./data/capitol_radar.db"
 log_level: "INFO"

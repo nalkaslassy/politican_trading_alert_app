@@ -26,15 +26,13 @@ _TZ = "America/New_York"
 
 _SIGNAL_RANK = {"strong": 3, "moderate": 2, "weak": 1, "unknown": 0}
 
-# Larger size = higher priority when capping per-politician alerts
 _SIZE_RANK = {
-    "1m":    7, "500k": 6, "250k": 5, "100k": 4,
-    "50k":   3, "15k":  2, "1k":   1,
+    "1m":   7, "500k": 6, "250k": 5, "100k": 4,
+    "50k":  3, "15k":  2, "1k":   1,
 }
 
 
 def _size_score(trade_size: str) -> int:
-    """Return a numeric rank for a trade size string (higher = larger trade)."""
     s = (trade_size or "").lower().replace("–", "-").replace(",", "")
     for key, rank in _SIZE_RANK.items():
         if key in s:
@@ -42,26 +40,47 @@ def _size_score(trade_size: str) -> int:
     return 0
 
 
-def _flag_bulk_filers(candidates: list[dict], bulk_threshold: int) -> None:
-    """Mark trades as bulk_filing=True when a politician files many trades on one date.
+def _select_alerts(
+    candidates: list[dict],
+    min_rank: int,
+    max_per_pol: int,
+    label: str,
+) -> tuple[list[dict], int, int]:
+    """Apply per-politician cap and signal gate.
 
-    A politician filing 10+ trades on the same date is almost certainly doing
-    routine portfolio rebalancing, not making a concentrated conviction bet.
-    Those trades are scored and stored but deprioritised in the alert queue.
+    Returns (alerts_to_send, suppressed_weak, suppressed_cap).
+    Candidates must be pre-sorted (structured_score DESC, then size DESC).
     """
-    counts: dict[tuple, int] = defaultdict(int)
-    for t in candidates:
-        key = (t.get("politician_name", ""), t.get("trade_date", ""))
-        counts[key] += 1
+    pol_counts: dict[str, int] = defaultdict(int)
+    alerts:     list[dict]     = []
+    suppressed_weak = 0
+    suppressed_cap  = 0
 
-    for t in candidates:
-        key = (t.get("politician_name", ""), t.get("trade_date", ""))
-        t["_bulk_filing"] = counts[key] >= bulk_threshold
-        if t["_bulk_filing"]:
-            logger.debug(
-                "%s filed %d trades on %s — flagged as bulk/rebalancing",
-                t.get("politician_name"), counts[key], t.get("trade_date"),
+    for trade in candidates:
+        pol    = trade.get("politician_name", "Unknown")
+        signal = trade.get("signal_strength", "unknown")
+        rank   = _SIGNAL_RANK.get(signal, 0)
+
+        if rank < min_rank:
+            suppressed_weak += 1
+            logger.info(
+                "[%s] SUPPRESSED (weak '%s')  %s  %s",
+                label, signal, trade.get("ticker"), pol,
             )
+            continue
+
+        if pol_counts[pol] >= max_per_pol:
+            suppressed_cap += 1
+            logger.info(
+                "[%s] SUPPRESSED (per-politician cap %d)  %s  %s",
+                label, max_per_pol, trade.get("ticker"), pol,
+            )
+            continue
+
+        pol_counts[pol] += 1
+        alerts.append(trade)
+
+    return alerts, suppressed_weak, suppressed_cap
 
 
 def run_outcome_updater(db) -> None:
@@ -74,136 +93,105 @@ def run_outcome_updater(db) -> None:
 def run_daily_pipeline(db, config) -> None:
     """Job 1: Scrape → Filter → Score → Alert pipeline.
 
-    Alert selection logic (in order):
-      1. Scrape all pages within the age window.
-      2. Filter: Buy, valid ticker, size ≥ $15K, not seen, entry point OK.
-      3. Flag bulk-filing days (politician filed ≥ bulk_filing_threshold trades
-         on the same date — likely routine rebalancing, not conviction bets).
-      4. Score every candidate with Claude Sonnet.
-      5. Sort by (signal_rank DESC, is_bulk_filing ASC, size_rank DESC).
-      6. Apply per-politician cap (max_alerts_per_politician) — ensures diversity.
-      7. Apply minimum signal strength gate — suppress weak/unknown scores.
-      8. Send surviving alerts to Telegram.
+    Pipeline (research-informed):
+      1. Scrape all pages within max_trade_age_days window.
+      2. Filter: separate buy_alerts, sell_alerts, store_only paths.
+         - Both buys and sells are scored (Molk & Partnoy: sells carry signal).
+         - Structured score from tabular features drives signal_strength.
+         - Basket likelihood (not binary bulk flag) handles rebalancing.
+         - Disclosure-date entry assessment (Lazzaretto 2024) for buys.
+         - ATR-normalised entry block instead of fixed percentage.
+      3. Score: Claude writes narrative only — does NOT determine signal_strength.
+      4. Sort by structured_score DESC, then size DESC.
+      5. Per-politician cap + signal gate.
+      6. Send buy alerts then sell alerts to Telegram.
     """
     logger.info("[Daily Pipeline] Started at %s", datetime.now().isoformat())
 
     trades = fetch_trades(config)
     logger.info("[Daily Pipeline] Scraped %d trades", len(trades))
 
-    trades_to_alert, trades_to_store_only = filter_trades(trades, config, db)
+    buy_candidates, sell_candidates, store_only = filter_trades(trades, config, db)
 
-    # Store and mark all qualifying Buy trades before scoring.
-    # alerted=True here means "passed the screener" — the signal gate below
-    # may still suppress the Telegram send, but the trade is tracked either way.
-    for trade in trades_to_alert:
+    # Store all (seen-marking happens after so we don't re-alert next run)
+    for trade in buy_candidates + sell_candidates:
         db.insert_trade(trade, alerted=True)
         db.mark_seen(trade["trade_id"])
-    for trade in trades_to_store_only:
+    for trade in store_only:
         db.insert_trade(trade, alerted=False)
         db.mark_seen(trade["trade_id"])
 
-    if not trades_to_alert:
-        logger.info(
-            "[Daily Pipeline] Finished — %d scraped, 0 alerted, %d stored silently",
-            len(trades), len(trades_to_store_only),
+    min_signal     = config.get("min_signal_strength", "moderate")
+    min_rank       = _SIGNAL_RANK.get(min_signal, 2)
+    max_per_pol    = int(config.get("max_alerts_per_politician", 3))
+
+    total_alerted = 0
+
+    # ── Buy alerts ─────────────────────────────────────────────────────
+    if buy_candidates:
+        # Sort by score first, then apply gates — Claude only called on survivors
+        buy_candidates.sort(
+            key=lambda t: (t.get("_structured_score", 0), _size_score(t.get("trade_size", ""))),
+            reverse=True,
         )
-        return
-
-    # Read config knobs
-    min_signal       = config.get("min_signal_strength", "moderate")
-    min_rank         = _SIGNAL_RANK.get(min_signal, 2)
-    max_per_pol      = int(config.get("max_alerts_per_politician", 3))
-    bulk_threshold   = int(config.get("bulk_filing_threshold", 6))
-
-    # Step 3 — flag bulk filers before scoring (cheaper than API calls)
-    _flag_bulk_filers(trades_to_alert, bulk_threshold)
-
-    bulk_count   = sum(1 for t in trades_to_alert if t.get("_bulk_filing"))
-    single_count = len(trades_to_alert) - bulk_count
-    logger.info(
-        "Candidates: %d single-conviction trades, %d bulk-filing trades",
-        single_count, bulk_count,
-    )
-
-    # Step 4 — score all candidates with Claude
-    scored: list[dict] = []
-    for trade in trades_to_alert:
-        stats        = db.get_politician_stats(trade.get("politician_name", ""))
-        scored_trade = score_trade(trade, stats, config)
-        scored.append(scored_trade)
-
-    # Step 5 — sort: signal quality DESC, bulk penalty, size DESC
-    scored.sort(
-        key=lambda t: (
-            _SIGNAL_RANK.get(t.get("signal_strength", "unknown"), 0),
-            0 if t.get("_bulk_filing") else 1,   # non-bulk trades first
-            _size_score(t.get("trade_size", "")),
-        ),
-        reverse=True,
-    )
-
-    # Steps 6 & 7 — per-politician cap + signal gate
-    pol_counts:    dict[str, int] = defaultdict(int)
-    alerts_to_send: list[dict]    = []
-    suppressed_weak   = 0
-    suppressed_cap    = 0
-    suppressed_bulk   = 0
-
-    for trade in scored:
-        pol    = trade.get("politician_name", "Unknown")
-        signal = trade.get("signal_strength", "unknown")
-        rank   = _SIGNAL_RANK.get(signal, 0)
-
-        if rank < min_rank:
-            suppressed_weak += 1
-            logger.info(
-                "SUPPRESSED (weak signal '%s')  %s  %s",
-                signal, trade.get("ticker"), pol,
-            )
-            continue
-
-        if pol_counts[pol] >= max_per_pol:
-            suppressed_cap += 1
-            logger.info(
-                "SUPPRESSED (per-politician cap %d)  %s  %s",
-                max_per_pol, trade.get("ticker"), pol,
-            )
-            continue
-
-        if trade.get("_bulk_filing") and rank < _SIGNAL_RANK.get("strong", 3):
-            suppressed_bulk += 1
-            logger.info(
-                "SUPPRESSED (bulk-filing day, signal='%s')  %s  %s",
-                signal, trade.get("ticker"), pol,
-            )
-            continue
-
-        pol_counts[pol] += 1
-        alerts_to_send.append(trade)
-
-    logger.info(
-        "Alert selection: %d to send | suppressed: %d weak, %d cap, %d bulk-rebalancing",
-        len(alerts_to_send), suppressed_weak, suppressed_cap, suppressed_bulk,
-    )
-
-    # Step 8 — send and update DB alerted flag
-    alerted_count = 0
-    for trade in alerts_to_send:
-        stats = db.get_politician_stats(trade.get("politician_name", ""))
-        send_trade_alert(trade, stats, config)
-        alerted_count += 1
+        buy_to_score, sup_weak, sup_cap = _select_alerts(
+            buy_candidates, min_rank, max_per_pol, "BUY"
+        )
         logger.info(
-            "ALERT SENT  %-6s  %-28s  signal=%-8s  entry=%s  move=%+.1f%%",
-            trade.get("ticker", "?"),
-            trade.get("politician_name", "?"),
-            trade.get("signal_strength", "?"),
-            trade.get("_entry_quality", "?"),
-            trade.get("_move_pct_since_trade", 0.0),
+            "[BUY] %d candidates → %d pass gate (suppressed: %d weak, %d cap) → calling Claude",
+            len(buy_candidates), len(buy_to_score), sup_weak, sup_cap,
         )
 
+        buy_alerts = []
+        for trade in buy_to_score:
+            stats = db.get_politician_stats(trade.get("politician_name", ""))
+            buy_alerts.append(score_trade(trade, stats, config))
+
+        for trade in buy_alerts:
+            stats = db.get_politician_stats(trade.get("politician_name", ""))
+            send_trade_alert(trade, stats, config)
+            total_alerted += 1
+            logger.info(
+                "BUY ALERT  %-6s  %-28s  score=%-3d  signal=%-8s  entry=%s",
+                trade.get("ticker", "?"), trade.get("politician_name", "?"),
+                trade.get("_structured_score", 0), trade.get("signal_strength", "?"),
+                trade.get("_entry_quality", "?"),
+            )
+
+    # ── Sell alerts ────────────────────────────────────────────────────
+    if sell_candidates:
+        sell_candidates.sort(
+            key=lambda t: (t.get("_structured_score", 0), _size_score(t.get("trade_size", ""))),
+            reverse=True,
+        )
+        sell_to_score, sup_weak, sup_cap = _select_alerts(
+            sell_candidates, min_rank, max_per_pol, "SELL"
+        )
+        logger.info(
+            "[SELL] %d candidates → %d pass gate (suppressed: %d weak, %d cap) → calling Claude",
+            len(sell_candidates), len(sell_to_score), sup_weak, sup_cap,
+        )
+
+        sell_alerts = []
+        for trade in sell_to_score:
+            stats = db.get_politician_stats(trade.get("politician_name", ""))
+            sell_alerts.append(score_trade(trade, stats, config))
+
+        for trade in sell_alerts:
+            stats = db.get_politician_stats(trade.get("politician_name", ""))
+            send_trade_alert(trade, stats, config)
+            total_alerted += 1
+            logger.info(
+                "SELL ALERT %-6s  %-28s  score=%-3d  signal=%-8s",
+                trade.get("ticker", "?"), trade.get("politician_name", "?"),
+                trade.get("_structured_score", 0), trade.get("signal_strength", "?"),
+            )
+
     logger.info(
-        "[Daily Pipeline] Finished — %d scraped, %d alerted, %d stored silently",
-        len(trades), alerted_count, len(trades_to_store_only),
+        "[Daily Pipeline] Finished — %d scraped, %d alerted (%d buys, %d sells), %d stored silently",
+        len(trades), total_alerted,
+        len(buy_candidates), len(sell_candidates),
+        len(store_only),
     )
 
 

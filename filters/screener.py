@@ -1,289 +1,427 @@
-"""Trade filtering and alpha-politician logic for Capitol Radar."""
+"""Trade filtering and structured pre-scoring for Capitol Radar.
+
+Research-informed design (see RESEARCH_BRIEF.md):
+
+1. BOTH buys and sells are tracked — the literature finds sell-side signal
+   is at least as reliable as buy-side post-STOCK Act.
+
+2. Size threshold is NOT a hard dollar cut-off. We use a relative-size
+   percentile against the politician's own trade history. A $15K trade from
+   a politician who normally files $1K buys is high-conviction; a $15K trade
+   from someone who routinely files $100K+ is noise.
+
+3. Basket likelihood replaces the binary bulk-filing flag. We score how
+   concentrated a trade is (1-2 tickers that day = conviction) vs how broad
+   (10+ tickers = rebalancing) using a 0–3 continuous score.
+
+4. Entry assessment uses the DISCLOSURE DATE (filing_date) as the primary
+   clock, not the execution date. Lazzaretto (2024) found alpha accrues after
+   disclosure, not after the original transaction. Price move is normalised
+   by ATR so that volatile stocks aren't unfairly blocked.
+
+5. Structured score feeds Claude — Claude does NOT determine signal strength.
+   It receives the pre-computed score and writes the human-readable narrative.
+"""
 
 import logging
 import re
 from datetime import date, datetime, timedelta
+from collections import defaultdict
 
 logger = logging.getLogger(__name__)
 
-_SMALL_SIZE_PHRASES = frozenset(
-    [
-        # Old capitoltrades.com format
-        "under $1,000",
-        "$1,001 - $15,000",
-        "$1,001-$15,000",
-        # New abbreviated format used by the site (e.g. "1K–15K")
-        "<1k",
-        "1k",
-        "1k–15k",
-        "1k-15k",
-    ]
-)
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
 _VALID_TICKER_RE = re.compile(r"^[A-Z]{1,5}$")
 
-# Date formats emitted by the scraper and stored in the DB
+# Date formats from the scraper
 _DATE_FORMATS = [
-    "%d %b %Y",   # "13 May 2026"  ← scraper output
-    "%Y-%m-%d",   # "2026-05-13"   ← ISO
+    "%d %b %Y",   # "13 May 2026"
+    "%Y-%m-%d",   # "2026-05-13"
     "%m/%d/%Y",   # "05/13/2026"
     "%B %d, %Y",  # "May 13, 2026"
 ]
 
+# Absolute minimum size to bother storing at all (bonds/tiny speculative trades)
+_ABS_MIN_SIZE_BAND = 2   # must be band 2+ ($1K–$15K still stored; <$1K dropped)
+
+# Map size band strings to a numeric rank (higher = larger)
+_SIZE_BANDS = {
+    "1m": 7, "500k": 6, "250k": 5, "100k": 4,
+    "50k": 3, "15k": 2, "1k": 1, "<1k": 0,
+}
+
+# Owner-type → conviction weight (Karadas: spouse portfolios > member)
+_OWNER_WEIGHT = {"Spouse": 3, "Self": 2, "Dependent": 1, "Unknown": 1}
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
 
 def _parse_trade_date(date_str: str) -> date | None:
-    """Parse a trade_date string into a date object; return None on failure."""
     if not date_str:
         return None
     cleaned = date_str.strip().replace("\n", " ")
+    # Site shows "HH:MM" or "Today" for same-day filings — treat as today
+    if "today" in cleaned.lower() or (len(cleaned) <= 5 and ":" in cleaned):
+        return date.today()
     for fmt in _DATE_FORMATS:
         try:
             return datetime.strptime(cleaned, fmt).date()
         except ValueError:
             continue
-    logger.debug("Could not parse trade date: %r", date_str)
     return None
 
 
 def _is_valid_ticker(ticker: str | None) -> bool:
-    """Return True if ticker is a plausible US equity symbol (1–5 uppercase letters)."""
     if not ticker:
         return False
     return bool(_VALID_TICKER_RE.match(ticker))
 
 
-def _is_small_trade(trade_size: str) -> bool:
-    """Return True if the trade size falls below the $15,001 alert threshold."""
-    if not trade_size:
-        return False
-    normalised = trade_size.strip().lower()
-    return any(phrase.lower() in normalised for phrase in _SMALL_SIZE_PHRASES)
+def _size_band(trade_size: str) -> int:
+    """Return numeric band 0–7 for a trade_size string."""
+    s = (trade_size or "").lower().replace("–", "-").replace(",", "")
+    for key, rank in sorted(_SIZE_BANDS.items(), key=lambda x: -x[1]):
+        if key in s:
+            return rank
+    return 0
 
 
-def _is_trade_recent(trade: dict, config: dict) -> tuple[bool, str]:
-    """Return (passes, reason) based on how old the trade_date is.
+def _size_band_to_dollars(band: int) -> int:
+    """Return approximate midpoint dollar value for a size band."""
+    mapping = {7: 1_500_000, 6: 750_000, 5: 375_000, 4: 175_000,
+               3: 75_000,   2: 32_500,  1: 8_000,   0: 500}
+    return mapping.get(band, 0)
 
-    The STOCK Act allows up to 45 days to disclose, so a trade filed today
-    could be 45 days old.  We allow up to max_trade_age_days (default 90)
-    to catch late filers while still excluding truly stale opportunities.
+# ---------------------------------------------------------------------------
+# Structured feature computation
+# ---------------------------------------------------------------------------
+
+def _compute_basket_score(trade: dict, all_candidates: list[dict]) -> int:
+    """Score how concentrated this trade is vs a broad basket (0=concentrated, 3=basket).
+
+    Uses the NUMBER OF UNIQUE TICKERS traded by this politician on the same
+    trade_date (not filing_date — avoids penalising late-filing batches).
     """
-    max_days = int(config.get("max_trade_age_days", 90))
-    trade_date = _parse_trade_date(trade.get("trade_date", ""))
-    if trade_date is None:
-        return True, ""  # can't determine — allow through
+    pol        = trade.get("politician_name", "")
+    trade_date = trade.get("trade_date", "")
+    same_day   = [
+        t for t in all_candidates
+        if t.get("politician_name") == pol
+        and t.get("trade_date") == trade_date
+    ]
+    n = len(same_day)
+    if n <= 2:   return 0   # concentrated conviction bet
+    if n <= 4:   return 1   # small cluster, some rebalancing possible
+    if n <= 8:   return 2   # likely rebalancing
+    return 3                # broad basket — routine rebalancing
 
-    age = (date.today() - trade_date).days
-    if age > max_days:
-        return False, f"trade is {age} days old (max {max_days})"
-    return True, ""
 
+def _compute_relative_size_score(trade: dict, history: list[dict]) -> float:
+    """Return percentile (0.0–1.0) of this trade's size vs politician's history.
 
-def _assess_entry_point(trade: dict, config: dict) -> tuple[bool, str]:
-    """Assess whether there is still a reasonable entry for this trade.
-
-    Returns (blocked, reason).  Attaches entry metadata to the trade dict so
-    the Telegram alert can surface useful context to the user:
-
-      _price_at_trade        closing price on (or nearest to) the trade date
-      _current_price         latest close
-      _move_pct_since_trade  % change from trade date to now (negative = discount)
-      _entry_quality         "fresh" | "caution" | "discount" | "blocked"
-      _entry_note            one-line comment included in the alert
-
-    Three configurable thresholds:
-      max_price_move_block (default 40%) — hard block; opportunity clearly passed.
-      max_price_move_warn  (default 15%) — still alert, flag the move as a caution.
-      max_price_move_disc  (default -10%) — stock is CHEAPER than when the politician
-                                            bought; highlight as a discount entry.
+    Falls back to 0.5 if there is no history (unknown, treated as median).
     """
-    block_pct = float(config.get("max_price_move_block", 40.0))
-    warn_pct  = float(config.get("max_price_move_warn",  15.0))
-    disc_pct  = float(config.get("max_price_move_disc", -10.0))
+    if not history:
+        return 0.5
 
-    ticker = trade.get("ticker")
-    trade_date_str = trade.get("trade_date", "")
+    current_band = _size_band(trade.get("trade_size", ""))
+    current_val  = _size_band_to_dollars(current_band)
 
-    if not ticker or not trade_date_str:
-        return False, ""
+    hist_vals = [_size_band_to_dollars(_size_band(h.get("trade_size", ""))) for h in history]
+    hist_vals = [v for v in hist_vals if v > 0]
+    if not hist_vals:
+        return 0.5
 
-    trade_date = _parse_trade_date(trade_date_str)
-    if trade_date is None:
-        return False, ""
+    below = sum(1 for v in hist_vals if v < current_val)
+    return below / len(hist_vals)
+
+
+def _compute_disclosure_entry(trade: dict, config: dict) -> tuple[bool, str, dict]:
+    """Assess entry using the DISCLOSURE DATE (filing_date) as the primary clock.
+
+    Normalises the price move by ATR so that volatile stocks aren't blocked
+    unfairly by a fixed percentage threshold.
+
+    Returns (blocked: bool, reason: str, metadata: dict).
+    Attaches _disclosure_* keys to metadata for the alert formatter.
+    """
+    ticker       = trade.get("ticker")
+    filing_date  = _parse_trade_date(trade.get("filing_date", ""))
+    trade_date   = _parse_trade_date(trade.get("trade_date", ""))
+
+    meta: dict = {}
+
+    if not ticker or not filing_date:
+        return False, "", meta
+
+    block_atr  = float(config.get("entry_block_atr_multiple",  3.0))
+    caution_atr = float(config.get("entry_caution_atr_multiple", 1.5))
+    disc_pct    = float(config.get("max_price_move_disc",       -10.0))
 
     try:
         import yfinance as yf
-
         tk = yf.Ticker(ticker)
 
-        # Price on (or near) the trade date
-        start = trade_date - timedelta(days=4)
-        end = trade_date + timedelta(days=2)
-        hist = tk.history(start=str(start), end=str(end))
-        if hist.empty:
-            logger.debug("No price history for %s around %s; skipping entry check", ticker, trade_date)
-            return False, ""
-        price_at_trade = float(hist["Close"].iloc[-1])
+        # Price at trade_date (politician's cost basis)
+        if trade_date:
+            hist_trade = tk.history(
+                start=str(trade_date - timedelta(days=4)),
+                end=str(trade_date + timedelta(days=2)),
+            )
+            price_at_trade = float(hist_trade["Close"].iloc[-1]) if not hist_trade.empty else None
+        else:
+            price_at_trade = None
+
+        # Price at filing_date (disclosure date — when information becomes public)
+        hist_disc = tk.history(
+            start=str(filing_date - timedelta(days=2)),
+            end=str(filing_date + timedelta(days=2)),
+        )
+        price_at_disclosure = float(hist_disc["Close"].iloc[-1]) if not hist_disc.empty else None
 
         # Current price
-        today_hist = tk.history(period="2d")
-        if today_hist.empty:
-            return False, ""
-        current_price = float(today_hist["Close"].iloc[-1])
+        today_hist  = tk.history(period="2d")
+        current_price = float(today_hist["Close"].iloc[-1]) if not today_hist.empty else None
 
-        if price_at_trade <= 0:
-            return False, ""
+        if not current_price or not price_at_disclosure:
+            return False, "", meta
 
-        move_pct = ((current_price - price_at_trade) / price_at_trade) * 100
+        # ATR (14-day) for normalisation
+        hist_atr = tk.history(period="30d")
+        if len(hist_atr) >= 2:
+            high_low  = hist_atr["High"] - hist_atr["Low"]
+            atr       = float(high_low.tail(14).mean())
+        else:
+            atr = None
 
-        trade["_price_at_trade"]       = round(price_at_trade, 2)
-        trade["_current_price"]        = round(current_price, 2)
-        trade["_move_pct_since_trade"] = round(move_pct, 1)
+        move_since_disclosure_pct = ((current_price - price_at_disclosure) / price_at_disclosure) * 100
+        days_since_disclosure     = (date.today() - filing_date).days
 
-        # Hard block — stock already ran hard; train has left the station
-        if move_pct >= block_pct:
-            trade["_entry_quality"] = "blocked"
-            trade["_entry_note"] = (
-                f"Already up {move_pct:.1f}% since trade — entry window has closed"
+        meta.update({
+            "_price_at_trade":           round(price_at_trade, 2) if price_at_trade else None,
+            "_price_at_disclosure":      round(price_at_disclosure, 2),
+            "_current_price":            round(current_price, 2),
+            "_move_pct_since_disclosure":round(move_since_disclosure_pct, 1),
+            "_days_since_disclosure":    days_since_disclosure,
+            "_atr":                      round(atr, 2) if atr else None,
+        })
+
+        # ATR-normalised move since disclosure
+        if atr and atr > 0:
+            atr_units = abs(move_since_disclosure_pct / 100 * price_at_disclosure) / atr
+            meta["_atr_units_moved"] = round(atr_units, 2)
+
+            if move_since_disclosure_pct > 0 and atr_units >= block_atr:
+                meta["_entry_quality"] = "blocked"
+                meta["_entry_note"]    = (
+                    f"Up {move_since_disclosure_pct:.1f}% ({atr_units:.1f}x ATR) "
+                    f"since disclosure {days_since_disclosure}d ago — opportunity passed"
+                )
+                return True, f"{ticker} moved {atr_units:.1f}x ATR since disclosure", meta
+
+            if move_since_disclosure_pct > 0 and atr_units >= caution_atr:
+                meta["_entry_quality"] = "caution"
+                meta["_entry_note"]    = (
+                    f"Up {move_since_disclosure_pct:.1f}% ({atr_units:.1f}x ATR) "
+                    f"since disclosure — confirm thesis still valid"
+                )
+                return False, "", meta
+
+        # Discount entry — cheaper now than at disclosure
+        if move_since_disclosure_pct <= disc_pct:
+            meta["_entry_quality"] = "discount"
+            meta["_entry_note"]    = (
+                f"Down {abs(move_since_disclosure_pct):.1f}% since disclosure "
+                f"(${price_at_disclosure:.2f} → ${current_price:.2f}) — "
+                f"better entry than when disclosed"
             )
-            return True, f"{ticker} already up {move_pct:.1f}% (hard block >{block_pct}%)"
+            return False, "", meta
 
-        # Discount — stock is cheaper than when the politician bought it (better entry)
-        if move_pct <= disc_pct:
-            trade["_entry_quality"] = "discount"
-            trade["_entry_note"] = (
-                f"Discount entry — stock is {abs(move_pct):.1f}% below politician's "
-                f"cost basis (${price_at_trade:.2f}). Thesis still intact."
-            )
-            return False, ""
-
-        # Caution — meaningful move but catalyst may still be ahead
-        if move_pct >= warn_pct:
-            trade["_entry_quality"] = "caution"
-            trade["_entry_note"] = (
-                f"Up {move_pct:.1f}% since trade date — confirm the catalyst "
-                f"is still pending before entering"
-            )
-            return False, ""
-
-        # Fresh — minimal price change, clean entry window
-        trade["_entry_quality"] = "fresh"
-        trade["_entry_note"] = (
-            f"Clean entry — only {move_pct:+.1f}% from politician's price (${price_at_trade:.2f})"
+        # Fresh — minimal move since disclosure
+        meta["_entry_quality"] = "fresh"
+        meta["_entry_note"]    = (
+            f"{move_since_disclosure_pct:+.1f}% since disclosure "
+            f"{days_since_disclosure}d ago — clean entry window"
         )
-        return False, ""
+        return False, "", meta
 
     except Exception as exc:
-        logger.debug("Entry-point check failed for %s: %s", ticker, exc)
-        return False, ""  # on error, allow the trade through
+        logger.debug("Entry assessment failed for %s: %s", ticker, exc)
+        return False, "", meta
 
 
-def is_alpha_politician(politician_name: str, config: dict, db) -> bool:
-    """Determine whether a politician qualifies for trade alerts.
+def _compute_structured_score(trade: dict, basket_score: int,
+                               rel_size: float, committee_overlap: int,
+                               history_count: int) -> tuple[int, str]:
+    """Compute a 0–100 structured signal score from tabular features.
 
-    Evaluation order:
-      1. Strict watchlist (config watchlist_mode == "strict")
-      2. Dynamic leaderboard stats (watchlist_mode == "dynamic")
-      3. Catch-all (watchlist_mode == "all")
+    Does NOT use LLM. Claude receives this score and writes the narrative.
+
+    Weights (research-informed):
+      Committee overlap (0-3)  → 0-30 pts  (strongest structural signal)
+      Owner type                → 0-20 pts  (spouse > self per Karadas)
+      Relative size percentile → 0-25 pts  (conviction relative to history)
+      Basket score (inverted)  → 0-15 pts  (concentrated = good)
+      History depth bonus      → 0-10 pts  (more history = more reliable percentile)
     """
-    mode = config.get("watchlist_mode", "strict")
+    owner_type = trade.get("owner_type", "Unknown")
 
-    if mode == "strict":
-        watchlist = [p.strip() for p in config.get("watchlist_politicians", [])]
-        return politician_name.strip() in watchlist
+    committee_pts = committee_overlap * 10              # 0, 10, 20, or 30
+    owner_pts     = {3: 20, 2: 15, 1: 8, 0: 5}.get(_OWNER_WEIGHT.get(owner_type, 1), 5)
+    size_pts      = int(rel_size * 25)                  # 0–25
+    basket_pts    = max(0, (3 - basket_score)) * 5      # 0, 5, 10, or 15
+    history_pts   = min(10, history_count // 5)         # 0–10
 
-    if mode == "dynamic":
-        min_trades = int(config.get("min_trades_for_dynamic", 5))
-        min_win_rate = float(config.get("min_win_rate", 0.60))
-        stats = db.get_politician_stats(politician_name)
-        if stats is None:
-            return False
-        return (
-            stats.get("total_buys", 0) >= min_trades
-            and stats.get("win_rate_30d", 0.0) >= min_win_rate
-        )
+    total = committee_pts + owner_pts + size_pts + basket_pts + history_pts
 
-    # "all" or any unrecognised mode — alert on everything
-    return True
+    breakdown = (
+        f"committee={committee_pts} owner={owner_pts} "
+        f"size={size_pts} concentration={basket_pts} history={history_pts}"
+    )
+    return min(100, total), breakdown
 
+
+def _score_to_strength(score: int, basket_score: int) -> str:
+    """Map structured score to signal_strength label."""
+    if basket_score >= 3:
+        return "weak"      # broad basket always weak regardless of score
+    if score >= 55:
+        return "strong"
+    if score >= 35:
+        return "moderate"
+    return "weak"
+
+
+# ---------------------------------------------------------------------------
+# Main filter function
+# ---------------------------------------------------------------------------
 
 def filter_trades(
     trades: list[dict], config: dict, db
-) -> tuple[list[dict], list[dict]]:
-    """Split trades into (trades_to_alert, trades_to_store_only).
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Split trades into (buy_alerts, sell_alerts, store_only).
 
-    Every Buy trade is stored regardless of outcome.  A trade reaches
-    trades_to_alert only when it passes ALL of:
-      1. Is a Buy
-      2. Valid US equity ticker (1–5 chars)
-      3. Size ≥ $15,001
-      4. Not already seen
-      5. Politician is on the alpha watchlist
-      6. Trade is recent enough (within max_trade_age_days)
-      7. Stock has NOT already blown past the hard-block threshold
-         (caution and discount entries still go through with context tags)
+    All qualifying Buy and Sell trades are stored.
+    buy_alerts  — Buy trades that pass all quality gates
+    sell_alerts — Sell trades that pass quality gates (exit signal)
+    store_only  — Everything else (stored silently for tracking)
     """
-    trades_to_alert: list[dict] = []
-    trades_to_store_only: list[dict] = []
+    buy_alerts:   list[dict] = []
+    sell_alerts:  list[dict] = []
+    store_only:   list[dict] = []
+
+    # Pre-compute basket scores using the full candidate set
+    all_buys  = [t for t in trades if t.get("trade_type") == "Buy"]
+    all_sells = [t for t in trades if t.get("trade_type") == "Sell"]
+
+    min_size_band = int(config.get("min_size_band", 2))   # default: ≥ $1K–$15K band
 
     for trade in trades:
-        trade_id = trade.get("trade_id", "")
+        trade_id   = trade.get("trade_id", "")
         trade_type = trade.get("trade_type", "")
-        ticker = trade.get("ticker")
-        trade_size = trade.get("trade_size", "")
+        ticker     = trade.get("ticker")
+        is_buy     = trade_type == "Buy"
+        is_sell    = trade_type == "Sell"
 
-        # Only track Buy trades at all
-        if trade_type != "Buy":
-            logger.debug("Skipping non-Buy trade %s (%s)", trade_id, trade_type)
+        if not is_buy and not is_sell:
             continue
 
-        # Deduplication — already processed
         if db.is_seen(trade_id):
-            logger.debug("Already seen trade %s; skipping", trade_id)
             continue
 
-        # --- Evaluate all alert criteria ---
-        reasons_blocked: list[str] = []
+        if not _is_valid_ticker(ticker):
+            store_only.append(trade)
+            continue
 
-        valid_ticker = _is_valid_ticker(ticker)
-        if not valid_ticker:
-            company = trade.get("company_name", "")
-            label   = f"'{company}'" if company else f"ticker='{ticker}'"
-            reasons_blocked.append(f"non-equity instrument {label} (no stock ticker)")
+        if _size_band(trade.get("trade_size", "")) < min_size_band:
+            store_only.append(trade)
+            continue
 
-        small_size = _is_small_trade(trade_size)
-        if small_size:
-            reasons_blocked.append(f"small size '{trade_size}'")
+        # Recency gate — trade_date within max_trade_age_days
+        max_age   = int(config.get("max_trade_age_days", 90))
+        trade_dt  = _parse_trade_date(trade.get("trade_date", ""))
+        if trade_dt and (date.today() - trade_dt).days > max_age:
+            store_only.append(trade)
+            continue
 
-        alpha = is_alpha_politician(trade.get("politician_name", ""), config, db)
-        if not alpha:
-            reasons_blocked.append("not alpha politician")
-
-        # Recency gate — don't alert on stale trades
-        recent, age_reason = _is_trade_recent(trade, config)
-        if not recent:
-            reasons_blocked.append(age_reason)
-
-        # Entry-point assessment — only run yfinance if trade passed the cheaper gates
-        if not reasons_blocked and valid_ticker:
-            entry_blocked, entry_reason = _assess_entry_point(trade, config)
-            if entry_blocked:
-                reasons_blocked.append(entry_reason)
-
-        if not reasons_blocked:
-            trades_to_alert.append(trade)
-            quality = trade.get("_entry_quality", "unknown")
-            move    = trade.get("_move_pct_since_trade", 0.0)
-            logger.info(
-                "Trade %s → ALERT  ticker=%-6s  entry=%s  move=%+.1f%%",
-                trade_id, ticker, quality, move,
+        # Disclosure staleness gate — filing_date within max_days_since_disclosure
+        # Alpha accrues quickly after disclosure and fades; stale filings are dead signals.
+        max_disc_age = int(config.get("max_days_since_disclosure", 21))
+        filing_dt    = _parse_trade_date(trade.get("filing_date", ""))
+        if filing_dt and (date.today() - filing_dt).days > max_disc_age:
+            logger.debug(
+                "Trade %s → store-only (disclosure %dd old, limit %d)",
+                trade_id, (date.today() - filing_dt).days, max_disc_age,
             )
+            store_only.append(trade)
+            continue
+
+        # ── Structured scoring ──────────────────────────────────────────
+        candidate_pool = all_buys if is_buy else all_sells
+        basket_score   = _compute_basket_score(trade, candidate_pool)
+
+        history        = db.get_politician_trade_history(trade.get("politician_name", ""))
+        rel_size       = _compute_relative_size_score(trade, history)
+
+        # Committee overlap (may do yfinance sector lookup)
+        try:
+            from filters.committee_overlap import get_committee_overlap_score
+            committee_overlap, committee_note = get_committee_overlap_score(
+                trade.get("politician_name", ""), ticker
+            )
+        except Exception:
+            committee_overlap, committee_note = 0, ""
+
+        structured_score, score_breakdown = _compute_structured_score(
+            trade, basket_score, rel_size, committee_overlap, len(history)
+        )
+        signal_strength = _score_to_strength(structured_score, basket_score)
+
+        # Attach computed features to trade dict for scorer and alert formatter
+        trade["_basket_score"]        = basket_score
+        trade["_rel_size_pct"]        = round(rel_size * 100, 1)
+        trade["_committee_overlap"]   = committee_overlap
+        trade["_committee_note"]      = committee_note
+        trade["_structured_score"]    = structured_score
+        trade["_score_breakdown"]     = score_breakdown
+        trade["signal_strength"] = signal_strength
+
+        # ── Entry point (buys only) — disclosure-date clock ────────────
+        if is_buy:
+            blocked, block_reason, entry_meta = _compute_disclosure_entry(trade, config)
+            trade.update(entry_meta)
+            if blocked:
+                trade["_entry_quality"] = "blocked"
+                store_only.append(trade)
+                logger.debug("Trade %s → store-only (entry blocked: %s)", trade_id, block_reason)
+                continue
+            # If yfinance returned nothing at all, the ticker is likely dead/delisted
+            if not entry_meta.get("_current_price") and not entry_meta.get("_entry_quality"):
+                logger.debug("Trade %s → store-only (ticker %s returned no price data)", trade_id, ticker)
+                store_only.append(trade)
+                continue
+
+        logger.info(
+            "%s %s %-6s  %-28s  score=%d (%s)  signal=%-8s  basket=%d  rel_size=%.0f%%  committee=%d",
+            "BUY " if is_buy else "SELL",
+            "→ ALERT" if signal_strength in ("strong", "moderate") else "→ weak ",
+            ticker, trade.get("politician_name", "")[:28],
+            structured_score, signal_strength,
+            signal_strength, basket_score,
+            rel_size * 100, committee_overlap,
+        )
+
+        if is_buy:
+            buy_alerts.append(trade)
         else:
-            trades_to_store_only.append(trade)
-            logger.debug("Trade %s → store-only (%s)", trade_id, "; ".join(reasons_blocked))
+            sell_alerts.append(trade)
 
     logger.info(
-        "Filter result: %d to alert, %d to store only",
-        len(trades_to_alert),
-        len(trades_to_store_only),
+        "Filter result: %d buy alerts, %d sell alerts, %d store-only",
+        len(buy_alerts), len(sell_alerts), len(store_only),
     )
-    return trades_to_alert, trades_to_store_only
+    return buy_alerts, sell_alerts, store_only

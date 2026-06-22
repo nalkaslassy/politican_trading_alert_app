@@ -58,6 +58,18 @@ def _normalise_trade_type(raw: str) -> str:
     return "Sell"
 
 
+def _normalise_owner(raw: str) -> str:
+    """Map the Owner cell text to a canonical owner type."""
+    low = raw.strip().lower()
+    if "spouse" in low:
+        return "Spouse"
+    if "dependent" in low or "child" in low:
+        return "Dependent"
+    if "self" in low or "member" in low:
+        return "Self"
+    return "Unknown"
+
+
 def _make_driver() -> webdriver.Remote:
     """Build a headless WebDriver — tries Chrome first (Linux/Docker), then Edge (Windows)."""
     common_args = [
@@ -168,6 +180,10 @@ def _scrape_page(driver: webdriver.Remote, page_num: int, first_page: bool) -> l
                     company_name, texts[7], texts[3],
                 )
 
+            # Owner column [5]: "Self", "Spouse", "Dependent Child", etc.
+            owner_raw  = texts[5].strip() if len(texts) > 5 else ""
+            owner_type = _normalise_owner(owner_raw)
+
             trade_type  = _normalise_trade_type(texts[6])
             trade_size  = texts[7]
             filing_date = texts[2].replace("\n", " ")   # "PUBLISHED" column
@@ -191,6 +207,7 @@ def _scrape_page(driver: webdriver.Remote, page_num: int, first_page: bool) -> l
                     "chamber":         chamber,
                     "company_name":    company_name,
                     "ticker":          ticker,
+                    "owner_type":      owner_type,
                     "trade_type":      trade_type,
                     "trade_size":      trade_size,
                     "trade_date":      trade_date,
@@ -206,10 +223,13 @@ def _scrape_page(driver: webdriver.Remote, page_num: int, first_page: bool) -> l
 
 def _parse_simple_date(date_str: str) -> date | None:
     """Parse a trade_date string as returned by the scraper."""
-    from datetime import datetime
+    from datetime import datetime, date as date_type
+    cleaned = (date_str or "").strip().replace("\n", " ")
+    if "today" in cleaned.lower() or (len(cleaned) <= 5 and ":" in cleaned):
+        return date_type.today()
     for fmt in ("%d %b %Y", "%Y-%m-%d", "%m/%d/%Y"):
         try:
-            return datetime.strptime(date_str.strip().replace("\n", " "), fmt).date()
+            return datetime.strptime(cleaned, fmt).date()
         except ValueError:
             continue
     return None

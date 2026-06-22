@@ -78,6 +78,19 @@ class Database:
         """
         with self._connect() as conn:
             conn.executescript(ddl)
+            # Migrate: add columns introduced in later versions
+            _migrations = [
+                "ALTER TABLE all_trades ADD COLUMN owner_type TEXT DEFAULT 'Unknown'",
+                "ALTER TABLE all_trades ADD COLUMN company_name TEXT",
+                "ALTER TABLE all_trades ADD COLUMN structured_score INTEGER DEFAULT 0",
+                "ALTER TABLE all_trades ADD COLUMN committee_overlap INTEGER DEFAULT 0",
+                "ALTER TABLE all_trades ADD COLUMN basket_score INTEGER DEFAULT 0",
+            ]
+            for stmt in _migrations:
+                try:
+                    conn.execute(stmt)
+                except Exception:
+                    pass  # column already exists
         logger.info("Database initialised at %s", self.db_path)
 
     # ------------------------------------------------------------------
@@ -108,16 +121,47 @@ class Database:
         """Insert a trade into all_trades; ignore if already stored."""
         sql = """
         INSERT OR IGNORE INTO all_trades
-            (trade_id, politician_name, party, chamber, ticker,
-             trade_type, trade_size, trade_date, filing_date, source_url, alerted)
+            (trade_id, politician_name, party, chamber, ticker, company_name,
+             trade_type, trade_size, trade_date, filing_date, source_url,
+             owner_type, structured_score, committee_overlap, basket_score, alerted)
         VALUES
-            (:trade_id, :politician_name, :party, :chamber, :ticker,
-             :trade_type, :trade_size, :trade_date, :filing_date, :source_url, :alerted)
+            (:trade_id, :politician_name, :party, :chamber, :ticker, :company_name,
+             :trade_type, :trade_size, :trade_date, :filing_date, :source_url,
+             :owner_type, :structured_score, :committee_overlap, :basket_score, :alerted)
         """
-        row = dict(trade)
-        row["alerted"] = 1 if alerted else 0
+        row = {
+            "trade_id":          trade.get("trade_id"),
+            "politician_name":   trade.get("politician_name"),
+            "party":             trade.get("party"),
+            "chamber":           trade.get("chamber"),
+            "ticker":            trade.get("ticker"),
+            "company_name":      trade.get("company_name"),
+            "trade_type":        trade.get("trade_type"),
+            "trade_size":        trade.get("trade_size"),
+            "trade_date":        trade.get("trade_date"),
+            "filing_date":       trade.get("filing_date"),
+            "source_url":        trade.get("source_url"),
+            "owner_type":        trade.get("owner_type", "Unknown"),
+            "structured_score":  trade.get("_structured_score", 0),
+            "committee_overlap": trade.get("_committee_overlap", 0),
+            "basket_score":      trade.get("_basket_score", 0),
+            "alerted":           1 if alerted else 0,
+        }
         with self._connect() as conn:
             conn.execute(sql, row)
+
+    def get_politician_trade_history(self, politician_name: str, limit: int = 50) -> list[dict]:
+        """Return the most recent stored trades for a politician (for relative-size scoring)."""
+        sql = """
+        SELECT trade_size, trade_date, trade_type, ticker
+        FROM all_trades
+        WHERE politician_name = ?
+        ORDER BY trade_date DESC
+        LIMIT ?
+        """
+        with self._connect() as conn:
+            rows = conn.execute(sql, (politician_name, limit)).fetchall()
+        return [dict(r) for r in rows]
 
     # ------------------------------------------------------------------
     # Performance tracking
