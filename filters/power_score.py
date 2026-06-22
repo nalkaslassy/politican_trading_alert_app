@@ -1,19 +1,20 @@
 """Power/influence scoring for congressional members.
 
-Based on Hall, Karadas & Schlosky (2019) and the 2025 NBER leadership paper.
-The NBER paper finds alpha concentrates specifically in FORMAL leadership
-(Speaker, floor leaders, whips, conference/caucus chairs) — not linearly
-across all seniority levels.
+Based on the 2025 NBER leadership paper. Evidence is concentrated among the
+~20 lawmakers who held formal leadership (Speaker, floor leaders, whips,
+conference/caucus chairs) — NOT generalized across all committee members
+or senior members.
 
-Score 0–28 (capped below 30 so freshness and issuer relevance drive the total):
+Score 0–28:
   28 = Speaker of the House
   26 = Senate/House Majority or Minority Leader
   22 = Whip, Conference/Caucus Chair, President Pro Tem
-  18 = Major committee Chair (Armed Services, Finance, Intelligence, etc.)
-  14 = Other committee Chair or Ranking Member; former leadership
-  10 = Senior / long-tenured member (10+ years, major committee)
-   7 = Regular member with known committee assignments
-   3 = Member with no committee data or very new member
+  16 = Major committee Chair (Armed Services, Finance, Intelligence, etc.)
+  12 = Other committee Chair
+  10 = Ranking Member; former Speaker or floor leader
+   8 = Former committee Chair
+   0 = Regular member, senior member, or unknown — seniority without a
+       formal agenda-setting role has no validated alpha per the paper
 """
 
 _POWER_SCORES: dict[str, int] = {
@@ -26,78 +27,51 @@ _POWER_SCORES: dict[str, int] = {
     "Tom Emmer":                22,   # House Majority Whip
     "Katherine Clark":          22,   # House Minority Whip
     "John Barrasso":            22,   # Senate Majority Whip
-    "Dick Durbin":              22,   # Senate Minority Whip (prev.)
+    "Dick Durbin":              22,   # Senate Minority Whip (ret. 2025)
     "Patty Murray":             22,   # President Pro Tempore
 
     # ── Major committee chairs ─────────────────────────────────────────────
-    "French Hill":              18,   # Chair, House Financial Services
-    "Roger Wicker":             18,   # Chair, Senate Armed Services
-    "John Boozman":             18,   # Chair, Senate Agriculture
-    "Tim Scott":                18,   # Chair, Senate Banking
-    "Tom Cotton":               18,   # Chair, Senate Intelligence
-    "Brett Guthrie":            18,   # Chair, House Energy & Commerce
-    "Jason Smith":              18,   # Chair, House Ways & Means
-    "Mike Turner":              18,   # Chair, House Intelligence
+    "French Hill":              16,   # Chair, House Financial Services
+    "Roger Wicker":             16,   # Chair, Senate Armed Services
+    "John Boozman":             16,   # Chair, Senate Agriculture
+    "Tim Scott":                16,   # Chair, Senate Banking
+    "Tom Cotton":               16,   # Chair, Senate Intelligence
+    "Brett Guthrie":            16,   # Chair, House Energy & Commerce
+    "Jason Smith":              16,   # Chair, House Ways & Means
+    "Mike Turner":              16,   # Chair, House Intelligence
 
-    # ── Other committee chairs / ranking members ───────────────────────────
-    "Mark Green":               14,   # Chair, House Homeland Security
-    "Jim Jordan":               14,   # Chair, House Judiciary
-    "Jodey Arrington":          14,   # Chair, House Budget
-    "Sam Graves":               14,   # Chair, House Transportation
-    "Brian Babin":              14,   # Chair, House Science, Space & Tech
-    "Debbie Wasserman Schultz": 14,   # Ranking, House Appropriations subcommittee
-    "Glenn Grothman":           10,   # House Oversight subcommittee
+    # ── Other committee chairs ─────────────────────────────────────────────
+    "Mark Green":               12,   # Chair, House Homeland Security
+    "Jim Jordan":               12,   # Chair, House Judiciary
+    "Jodey Arrington":          12,   # Chair, House Budget
+    "Sam Graves":               12,   # Chair, House Transportation
+    "Brian Babin":              12,   # Chair, House Science, Space & Tech
 
-    # ── Former leadership / senior long-tenured members ───────────────────
-    "Nancy Pelosi":             18,   # Former Speaker, 30+ year veteran
-    "Mitch McConnell":          18,   # Former Senate Majority Leader
-    "Kevin McCarthy":           14,   # Former Speaker
-    "Patrick McHenry":          14,   # Former Chair, House Financial Services
-    "Richard Burr":             14,   # Former Chair, Senate Intelligence
-    "Richard Shelby":           14,   # Former Chair, Senate Appropriations
-    "Michael McCaul":           10,   # Foreign Affairs + Science; 10+ year senior
-    "Rick Scott":               10,   # Banking + Budget + Commerce; senator
+    # ── Ranking members ────────────────────────────────────────────────────
+    "Debbie Wasserman Schultz": 10,   # Ranking, House Appropriations subcommittee
 
-    # ── Regular members with known committee assignments ──────────────────
-    "Ro Khanna":                 7,   # Armed Services + Science/Tech
-    "Dan Crenshaw":              7,   # Intelligence + Homeland Security
-    "Josh Gottheimer":           7,   # Financial Services + Homeland Security
-    "Tommy Tuberville":          7,   # Armed Services + Agriculture
-    "Donald Norcross":           7,   # Armed Services + Transportation
-    "Terri Sewell":              7,   # Ways and Means
-    "Brian Mast":                7,   # Foreign Affairs + Transportation
-    "Nick LaLota":               7,   # Financial Services + Homeland Security
-    "Marjorie Taylor Greene":    7,   # Budget + Oversight
-    "Warren Davidson":           7,   # Financial Services
-    "David Rouzer":              7,   # Agriculture + Transportation
-    "John Fetterman":            7,   # Agriculture + Banking + Judiciary
-    "Gary Peters":               7,   # Armed Services + Homeland Security
-    "Steve Cohen":               7,   # Judiciary + Transportation
-    "Mike Kelly":                7,   # Ways and Means + Oversight
-    "John McGuire":              7,   # Armed Services
-    "Nicholas Begich III":       7,   # Armed Services + Transportation
-    "Rick Allen":                7,   # Agriculture + Budget
-    "Thomas Kean Jr":            7,   # Science Space Technology + Homeland Security
-    "Kevin Hern":                7,   # Ways and Means + Budget
-    "Andy Barr":                 7,   # Financial Services
-    "Bill Foster":               7,   # Financial Services + Science
-    "Jared Moskowitz":           7,   # Appropriations + Oversight
-    "Jonathan Jackson":          7,   # Oversight
-    "Chip Roy":                  7,   # Budget + Oversight
-    "David Taylor":              7,   # Financial Services + Oversight
-    "Tim Moore":                 3,   # Judiciary (limited data)
-    "Matt Van Epps":             3,   # No mapped committee
+    # ── Former formal leadership (still influential through networks) ──────
+    "Nancy Pelosi":             10,   # Former Speaker
+    "Mitch McConnell":          10,   # Former Senate Majority Leader
+    "Kevin McCarthy":           10,   # Former Speaker (resigned Dec 2023)
+
+    # ── Former committee chairs ────────────────────────────────────────────
+    "Patrick McHenry":           8,   # Former Chair, House Financial Services
+    "Richard Burr":              8,   # Former Chair, Senate Intelligence
+    "Richard Shelby":            8,   # Former Chair, Senate Appropriations
+
+    # NOTE: All regular committee members and unknown roles score 0.
+    # Seniority without formal agenda-setting power has no validated alpha.
 }
 
-_DEFAULT_SCORE = 3   # Unknown member — no evidence of informational advantage
+_DEFAULT_SCORE = 0   # Unknown or regular member — no evidence of informational advantage
 
 
 def get_power_score(politician_name: str) -> tuple[int, str]:
     """Return (score 0-28, explanation) for a politician.
 
-    Scores reflect formal leadership role and committee chair status.
-    Per NBER 2025, alpha concentrates in formal agenda-setting power,
-    not seniority alone.
+    Only formal agenda-setting roles earn points. Regular committee
+    membership and seniority are explicitly excluded per NBER 2025.
     """
     score = _POWER_SCORES.get(politician_name, _DEFAULT_SCORE)
 
@@ -107,15 +81,15 @@ def get_power_score(politician_name: str) -> tuple[int, str]:
         note = f"{politician_name}: Speaker of the House"
     elif score >= 22:
         note = f"{politician_name}: Senior leadership / Whip"
-    elif score >= 18:
+    elif score >= 16:
         note = f"{politician_name}: Major committee Chair"
-    elif score >= 14:
-        note = f"{politician_name}: Committee Chair / Ranking Member"
+    elif score >= 12:
+        note = f"{politician_name}: Committee Chair"
     elif score >= 10:
-        note = f"{politician_name}: Senior / long-tenured member"
-    elif score >= 7:
-        note = f"{politician_name}: Active committee member"
+        note = f"{politician_name}: Ranking Member / Former leadership"
+    elif score >= 8:
+        note = f"{politician_name}: Former committee Chair"
     else:
-        note = f"{politician_name}: Limited influence data"
+        note = f"{politician_name}: No formal leadership role"
 
     return score, note

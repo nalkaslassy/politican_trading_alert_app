@@ -179,17 +179,29 @@ class Database:
             conn.execute(sql, row)
 
     def get_prior_trade_count(self, politician_name: str, ticker: str) -> int:
-        """Return how many times this politician has previously traded this ticker.
-
-        Used for the repeat-trader bonus (Lazzaretto 2024: repeated same-stock
-        trades in the same direction are associated with stronger abnormal returns).
-        """
+        """Return how many times this politician has previously traded this ticker."""
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT COUNT(*) FROM all_trades WHERE politician_name = ? AND ticker = ?",
                 (politician_name, ticker),
             ).fetchone()
         return row[0] if row else 0
+
+    def get_prior_buy_sell_counts(self, politician_name: str, ticker: str) -> tuple[int, int]:
+        """Return (prior_buys, prior_sells) for this politician/ticker pair.
+
+        Used for direction-aware repeat scoring (Lazzaretto 2024): repeated
+        same-direction buys signal conviction; alternating buys and sells
+        suggest routine two-way trading rather than informed accumulation.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT trade_type, COUNT(*) as cnt FROM all_trades "
+                "WHERE politician_name = ? AND ticker = ? GROUP BY trade_type",
+                (politician_name, ticker),
+            ).fetchall()
+        counts = {r["trade_type"]: r["cnt"] for r in rows}
+        return counts.get("Buy", 0), counts.get("Sell", 0)
 
     def insert_alert_performance(self, trade: dict, entry_price: float | None,
                                   spy_entry: float | None) -> None:

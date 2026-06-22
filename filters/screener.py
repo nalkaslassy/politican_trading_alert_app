@@ -267,21 +267,33 @@ def _compute_freshness_score(days_since_disclosure: int) -> int:
     return 0
 
 
-def _compute_repeat_pts(prior_count: int) -> int:
-    """Return 0–6 pts for repeated same-ticker trading (Lazzaretto 2024).
+def _compute_repeat_pts(prior_buys: int, prior_sells: int) -> int:
+    """Return 0–6 pts for direction-aware repeat same-ticker buying.
 
-    Graduated rather than binary: frequency alone doesn't prove conviction;
-    just 1 prior trade is weak evidence, 4+ is a clearer pattern.
-    Capped at 6 (not 10) because direction-awareness is unavailable.
+    Counts only prior BUY transactions as conviction evidence; penalises
+    alternating buy/sell activity which suggests routine two-way trading
+    rather than informed accumulation (Lazzaretto 2024).
     """
-    if prior_count == 0:   return 0
-    if prior_count == 1:   return 2
-    if prior_count <= 3:   return 5
-    return 6
+    if prior_buys == 0:
+        score = 0
+    elif prior_buys == 1:
+        score = 2
+    elif prior_buys <= 3:
+        score = 5
+    else:
+        score = 6
+
+    # Penalise two-way trading — prior sells dilute conviction signal
+    if prior_sells >= prior_buys:
+        score -= 2
+    elif prior_sells > 0:
+        score -= 1
+
+    return max(0, min(score, 6))
 
 
 def _compute_structured_score(trade: dict, basket_score: int, committee_overlap: int,
-                               power_score: int, repeat_count: int,
+                               power_score: int, prior_buys: int, prior_sells: int,
                                freshness_pts: int) -> tuple[int, str]:
     """Compute a 0–100 structured signal score from tabular features.
 
@@ -304,7 +316,7 @@ def _compute_structured_score(trade: dict, basket_score: int, committee_overlap:
     power_pts     = min(28, power_score)
     committee_pts = min(30, committee_overlap * 10)     # 0, 10, 20, 30
     freshness_pts = min(20, freshness_pts)
-    repeat_pts    = _compute_repeat_pts(repeat_count)
+    repeat_pts    = _compute_repeat_pts(prior_buys, prior_sells)
     owner_weight  = _OWNER_WEIGHT.get(owner_type, 1)
     owner_pts     = {3: 5, 2: 3, 1: 1, 0: 1}.get(owner_weight, 1)
     basket_pts    = {0: 5, 1: 3, 2: 1, 3: 0}.get(basket_score, 0)
@@ -330,9 +342,8 @@ def _score_to_strength(score: int, basket_score: int,
         return "weak"   # broad portfolio event — not a conviction signal
 
     if (score >= 65
-            and power_pts >= 10
-            and committee_pts >= 10
-            and freshness_pts >= 10):
+            and freshness_pts >= 10
+            and (committee_pts >= 10 or power_pts >= 22)):
         return "strong"
 
     if score >= 45 and (power_pts >= 8 or committee_pts >= 12):
@@ -429,11 +440,11 @@ def filter_trades(
         except Exception:
             committee_overlap, committee_note = 0, ""
 
-        # Repeat-trader pattern (Lazzaretto 2024: graduated, not binary)
+        # Repeat-trader pattern — direction-aware (Lazzaretto 2024)
         try:
-            repeat_count = db.get_prior_trade_count(pol_name, ticker)
+            prior_buys, prior_sells = db.get_prior_buy_sell_counts(pol_name, ticker)
         except Exception:
-            repeat_count = 0
+            prior_buys, prior_sells = 0, 0
 
         # Relative size (kept for display/DB only — not used in score per Belmont 2022)
         history  = db.get_politician_trade_history(pol_name)
@@ -443,7 +454,8 @@ def filter_trades(
         committee_pts = min(30, committee_overlap * 10)
 
         structured_score, score_breakdown = _compute_structured_score(
-            trade, basket_score, committee_overlap, power_score, repeat_count, freshness_pts
+            trade, basket_score, committee_overlap, power_score,
+            prior_buys, prior_sells, freshness_pts
         )
         signal_strength = _score_to_strength(
             structured_score, basket_score, power_pts, committee_pts, freshness_pts
@@ -456,7 +468,8 @@ def filter_trades(
         trade["_committee_note"]      = committee_note
         trade["_power_score"]         = power_score
         trade["_power_note"]          = power_note
-        trade["_repeat_count"]        = repeat_count
+        trade["_prior_buys"]          = prior_buys
+        trade["_prior_sells"]         = prior_sells
         trade["_freshness_pts"]       = freshness_pts
         trade["_structured_score"]    = structured_score
         trade["_score_breakdown"]     = score_breakdown
