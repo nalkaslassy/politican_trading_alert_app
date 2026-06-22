@@ -79,12 +79,40 @@ class Database:
         with self._connect() as conn:
             conn.executescript(ddl)
             # Migrate: add columns introduced in later versions
+            # alert_performance tracks every alerted buy with forward price data
+            conn.executescript("""
+            CREATE TABLE IF NOT EXISTS alert_performance (
+                trade_id TEXT PRIMARY KEY,
+                ticker TEXT,
+                politician_name TEXT,
+                signal_strength TEXT,
+                structured_score INTEGER,
+                power_score INTEGER,
+                committee_overlap INTEGER,
+                owner_type TEXT,
+                alert_date TEXT,
+                entry_price REAL,
+                spy_entry REAL,
+                price_7d REAL,
+                price_30d REAL,
+                price_60d REAL,
+                price_90d REAL,
+                spy_7d REAL,
+                spy_30d REAL,
+                spy_60d REAL,
+                spy_90d REAL,
+                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            """)
             _migrations = [
                 "ALTER TABLE all_trades ADD COLUMN owner_type TEXT DEFAULT 'Unknown'",
                 "ALTER TABLE all_trades ADD COLUMN company_name TEXT",
                 "ALTER TABLE all_trades ADD COLUMN structured_score INTEGER DEFAULT 0",
                 "ALTER TABLE all_trades ADD COLUMN committee_overlap INTEGER DEFAULT 0",
                 "ALTER TABLE all_trades ADD COLUMN basket_score INTEGER DEFAULT 0",
+                "ALTER TABLE alert_performance ADD COLUMN power_score INTEGER DEFAULT 0",
+                "ALTER TABLE alert_performance ADD COLUMN committee_overlap INTEGER DEFAULT 0",
+                "ALTER TABLE alert_performance ADD COLUMN owner_type TEXT DEFAULT 'Unknown'",
             ]
             for stmt in _migrations:
                 try:
@@ -149,6 +177,77 @@ class Database:
         }
         with self._connect() as conn:
             conn.execute(sql, row)
+
+    def get_prior_trade_count(self, politician_name: str, ticker: str) -> int:
+        """Return how many times this politician has previously traded this ticker.
+
+        Used for the repeat-trader bonus (Lazzaretto 2024: repeated same-stock
+        trades in the same direction are associated with stronger abnormal returns).
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM all_trades WHERE politician_name = ? AND ticker = ?",
+                (politician_name, ticker),
+            ).fetchone()
+        return row[0] if row else 0
+
+    def insert_alert_performance(self, trade: dict, entry_price: float | None,
+                                  spy_entry: float | None) -> None:
+        """Record an alerted buy trade for performance tracking."""
+        from datetime import date
+        sql = """
+        INSERT OR IGNORE INTO alert_performance
+            (trade_id, ticker, politician_name, signal_strength, structured_score,
+             power_score, committee_overlap, owner_type, alert_date, entry_price, spy_entry)
+        VALUES
+            (:trade_id, :ticker, :politician_name, :signal_strength, :structured_score,
+             :power_score, :committee_overlap, :owner_type, :alert_date, :entry_price, :spy_entry)
+        """
+        with self._connect() as conn:
+            conn.execute(sql, {
+                "trade_id":         trade.get("trade_id"),
+                "ticker":           trade.get("ticker"),
+                "politician_name":  trade.get("politician_name"),
+                "signal_strength":  trade.get("signal_strength"),
+                "structured_score": trade.get("_structured_score", 0),
+                "power_score":      trade.get("_power_score", 0),
+                "committee_overlap":trade.get("_committee_overlap", 0),
+                "owner_type":       trade.get("owner_type", "Unknown"),
+                "alert_date":       str(date.today()),
+                "entry_price":      entry_price,
+                "spy_entry":        spy_entry,
+            })
+
+    def get_open_alert_performances(self) -> list[dict]:
+        """Return alerted trades still missing some forward price data."""
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT * FROM alert_performance
+                WHERE price_90d IS NULL AND entry_price IS NOT NULL
+                ORDER BY alert_date
+            """).fetchall()
+        return [dict(r) for r in rows]
+
+    def update_alert_performance(self, trade_id: str, fields: dict) -> None:
+        """Update forward price fields for a tracked alert."""
+        if not fields:
+            return
+        sets = ", ".join(f"{k} = :{k}" for k in fields)
+        fields["trade_id"] = trade_id
+        with self._connect() as conn:
+            conn.execute(
+                f"UPDATE alert_performance SET {sets}, last_updated = CURRENT_TIMESTAMP "
+                f"WHERE trade_id = :trade_id",
+                fields,
+            )
+
+    def get_all_alert_performances(self) -> list[dict]:
+        """Return all tracked alerts (for the performance report)."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM alert_performance ORDER BY alert_date DESC"
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def get_politician_trade_history(self, politician_name: str, limit: int = 50) -> list[dict]:
         """Return the most recent stored trades for a politician (for relative-size scoring)."""

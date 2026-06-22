@@ -255,32 +255,36 @@ def _compute_disclosure_entry(trade: dict, config: dict) -> tuple[bool, str, dic
 
 
 def _compute_structured_score(trade: dict, basket_score: int,
-                               rel_size: float, committee_overlap: int,
-                               history_count: int) -> tuple[int, str]:
+                               committee_overlap: int, power_score: int,
+                               repeat_trader: bool) -> tuple[int, str]:
     """Compute a 0–100 structured signal score from tabular features.
 
     Does NOT use LLM. Claude receives this score and writes the narrative.
 
-    Weights (research-informed):
-      Committee overlap (0-3)  → 0-30 pts  (strongest structural signal)
-      Owner type                → 0-20 pts  (spouse > self per Karadas)
-      Relative size percentile → 0-25 pts  (conviction relative to history)
-      Basket score (inverted)  → 0-15 pts  (concentrated = good)
-      History depth bonus      → 0-10 pts  (more history = more reliable percentile)
+    Weights (research-informed, updated per Belmont 2022 / NBER 2025):
+      Power/influence           → 0-35 pts  (strongest modern signal — NBER 2025 leadership paper)
+      Committee overlap (0-3)  → 0-25 pts  (direct jurisdiction per Dong & Xu 2025)
+      Owner type                → 0-20 pts  (spouse > self per Karadas 2019)
+      Basket score (inverted)  → 0-10 pts  (concentration; unvalidated but intuitive)
+      Repeat-trader bonus       → 0-10 pts  (repeated same-stock trades per Lazzaretto 2024)
+
+    Removed (per Belmont 2022 — larger trades underperform post-STOCK Act):
+      Trade size                → 0 pts
+      Relative size history     → 0 pts
     """
     owner_type = trade.get("owner_type", "Unknown")
 
-    committee_pts = committee_overlap * 10              # 0, 10, 20, or 30
-    owner_pts     = {3: 20, 2: 15, 1: 8, 0: 5}.get(_OWNER_WEIGHT.get(owner_type, 1), 5)
-    size_pts      = int(rel_size * 25)                  # 0–25
-    basket_pts    = max(0, (3 - basket_score)) * 5      # 0, 5, 10, or 15
-    history_pts   = min(10, history_count // 5)         # 0–10
+    power_pts     = min(35, power_score)
+    committee_pts = min(25, committee_overlap * 8)      # 0, 8, 16, or 24 → cap 25
+    owner_pts     = {3: 20, 2: 15, 1: 5, 0: 5}.get(_OWNER_WEIGHT.get(owner_type, 1), 5)
+    basket_pts    = max(0, (3 - basket_score)) * 3      # 0, 3, 6, or 9
+    repeat_pts    = 10 if repeat_trader else 0
 
-    total = committee_pts + owner_pts + size_pts + basket_pts + history_pts
+    total = power_pts + committee_pts + owner_pts + basket_pts + repeat_pts
 
     breakdown = (
-        f"committee={committee_pts} owner={owner_pts} "
-        f"size={size_pts} concentration={basket_pts} history={history_pts}"
+        f"power={power_pts} committee={committee_pts} owner={owner_pts} "
+        f"concentration={basket_pts} repeat={repeat_pts}"
     )
     return min(100, total), breakdown
 
@@ -364,20 +368,35 @@ def filter_trades(
         candidate_pool = all_buys if is_buy else all_sells
         basket_score   = _compute_basket_score(trade, candidate_pool)
 
-        history        = db.get_politician_trade_history(trade.get("politician_name", ""))
-        rel_size       = _compute_relative_size_score(trade, history)
+        pol_name = trade.get("politician_name", "")
+
+        # Power/influence score (Hall-Karadas-Schlosky, NBER 2025)
+        try:
+            from filters.power_score import get_power_score
+            power_score, power_note = get_power_score(pol_name)
+        except Exception:
+            power_score, power_note = 5, ""
 
         # Committee overlap (may do yfinance sector lookup)
         try:
             from filters.committee_overlap import get_committee_overlap_score
-            committee_overlap, committee_note = get_committee_overlap_score(
-                trade.get("politician_name", ""), ticker
-            )
+            committee_overlap, committee_note = get_committee_overlap_score(pol_name, ticker)
         except Exception:
             committee_overlap, committee_note = 0, ""
 
+        # Repeat-trader bonus (Lazzaretto 2024: repeated same-stock trades are speculative signals)
+        try:
+            repeat_count  = db.get_prior_trade_count(pol_name, ticker)
+            repeat_trader = repeat_count > 0
+        except Exception:
+            repeat_trader = False
+
+        # Relative size (kept for display/DB only — not used in score per Belmont 2022)
+        history  = db.get_politician_trade_history(pol_name)
+        rel_size = _compute_relative_size_score(trade, history)
+
         structured_score, score_breakdown = _compute_structured_score(
-            trade, basket_score, rel_size, committee_overlap, len(history)
+            trade, basket_score, committee_overlap, power_score, repeat_trader
         )
         signal_strength = _score_to_strength(structured_score, basket_score)
 
@@ -386,9 +405,12 @@ def filter_trades(
         trade["_rel_size_pct"]        = round(rel_size * 100, 1)
         trade["_committee_overlap"]   = committee_overlap
         trade["_committee_note"]      = committee_note
+        trade["_power_score"]         = power_score
+        trade["_power_note"]          = power_note
+        trade["_repeat_trader"]       = repeat_trader
         trade["_structured_score"]    = structured_score
         trade["_score_breakdown"]     = score_breakdown
-        trade["signal_strength"] = signal_strength
+        trade["signal_strength"]      = signal_strength
 
         # ── Entry point (buys only) — disclosure-date clock ────────────
         if is_buy:

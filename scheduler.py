@@ -17,8 +17,7 @@ from scraper.capitol_trades import fetch_trades
 from filters.screener import filter_trades
 from scorer.signal import score_trade
 from alerts.telegram import send_trade_alert
-from performance.tracker import update_outcomes
-from performance.leaderboard import post_leaderboard
+from performance.tracker import update_alert_prices, get_spy_price_now
 
 logger = logging.getLogger(__name__)
 
@@ -83,11 +82,11 @@ def _select_alerts(
     return alerts, suppressed_weak, suppressed_cap
 
 
-def run_outcome_updater(db) -> None:
-    """Job 2: Update trade outcomes and politician stats."""
-    logger.info("[Outcome Updater] Started at %s", datetime.now().isoformat())
-    update_outcomes(db)
-    logger.info("[Outcome Updater] Finished at %s", datetime.now().isoformat())
+def run_performance_updater(db) -> None:
+    """Job 2: Update forward prices for all alerted trades."""
+    logger.info("[Performance Updater] Started at %s", datetime.now().isoformat())
+    updated = update_alert_prices(db)
+    logger.info("[Performance Updater] Finished — %d alerts updated", updated)
 
 
 def run_daily_pipeline(db, config) -> None:
@@ -95,16 +94,14 @@ def run_daily_pipeline(db, config) -> None:
 
     Pipeline (research-informed):
       1. Scrape all pages within max_trade_age_days window.
-      2. Filter: separate buy_alerts, sell_alerts, store_only paths.
-         - Both buys and sells are scored (Molk & Partnoy: sells carry signal).
-         - Structured score from tabular features drives signal_strength.
-         - Basket likelihood (not binary bulk flag) handles rebalancing.
-         - Disclosure-date entry assessment (Lazzaretto 2024) for buys.
-         - ATR-normalised entry block instead of fixed percentage.
-      3. Score: Claude writes narrative only — does NOT determine signal_strength.
-      4. Sort by structured_score DESC, then size DESC.
-      5. Per-politician cap + signal gate.
-      6. Send buy alerts then sell alerts to Telegram.
+      2. Filter: score buys using power/influence + committee + owner type.
+         - Sells stored to DB silently (no Telegram — evidence too ambiguous).
+         - Structured score gates: strong ≥55, moderate ≥35.
+         - Basket likelihood handles rebalancing noise.
+         - Disclosure-date entry assessment (Lazzaretto 2024).
+      3. Gate + cap BEFORE Claude — only call API on trades that will alert.
+      4. Claude writes narrative only; does NOT set signal_strength.
+      5. Log alert to alert_performance for P&L tracking.
     """
     logger.info("[Daily Pipeline] Started at %s", datetime.now().isoformat())
 
@@ -147,71 +144,48 @@ def run_daily_pipeline(db, config) -> None:
             stats = db.get_politician_stats(trade.get("politician_name", ""))
             buy_alerts.append(score_trade(trade, stats, config))
 
+        # Fetch SPY once for performance logging
+        spy_entry = get_spy_price_now()
+
         for trade in buy_alerts:
             stats = db.get_politician_stats(trade.get("politician_name", ""))
             send_trade_alert(trade, stats, config)
             total_alerted += 1
+
+            # Log to performance tracker with entry price
+            entry_price = trade.get("_current_price")
+            db.insert_alert_performance(trade, entry_price, spy_entry)
+
             logger.info(
-                "BUY ALERT  %-6s  %-28s  score=%-3d  signal=%-8s  entry=%s",
+                "BUY ALERT  %-6s  %-28s  score=%-3d  signal=%-8s  entry=$%s",
                 trade.get("ticker", "?"), trade.get("politician_name", "?"),
                 trade.get("_structured_score", 0), trade.get("signal_strength", "?"),
-                trade.get("_entry_quality", "?"),
+                entry_price or "?",
             )
 
-    # ── Sell alerts ────────────────────────────────────────────────────
+    # ── Sells stored silently — evidence too ambiguous to alert ────────
     if sell_candidates:
-        sell_candidates.sort(
-            key=lambda t: (t.get("_structured_score", 0), _size_score(t.get("trade_size", ""))),
-            reverse=True,
-        )
-        sell_to_score, sup_weak, sup_cap = _select_alerts(
-            sell_candidates, min_rank, max_per_pol, "SELL"
-        )
         logger.info(
-            "[SELL] %d candidates → %d pass gate (suppressed: %d weak, %d cap) → calling Claude",
-            len(sell_candidates), len(sell_to_score), sup_weak, sup_cap,
+            "[SELL] %d sell candidates stored silently (no Telegram alerts)",
+            len(sell_candidates),
         )
-
-        sell_alerts = []
-        for trade in sell_to_score:
-            stats = db.get_politician_stats(trade.get("politician_name", ""))
-            sell_alerts.append(score_trade(trade, stats, config))
-
-        for trade in sell_alerts:
-            stats = db.get_politician_stats(trade.get("politician_name", ""))
-            send_trade_alert(trade, stats, config)
-            total_alerted += 1
-            logger.info(
-                "SELL ALERT %-6s  %-28s  score=%-3d  signal=%-8s",
-                trade.get("ticker", "?"), trade.get("politician_name", "?"),
-                trade.get("_structured_score", 0), trade.get("signal_strength", "?"),
-            )
 
     logger.info(
-        "[Daily Pipeline] Finished — %d scraped, %d alerted (%d buys, %d sells), %d stored silently",
-        len(trades), total_alerted,
-        len(buy_candidates), len(sell_candidates),
-        len(store_only),
+        "[Daily Pipeline] Finished — %d scraped, %d buy alerts, %d sells stored, %d store-only",
+        len(trades), total_alerted, len(sell_candidates), len(store_only),
     )
 
 
-def run_weekly_leaderboard(db, config) -> None:
-    """Job 3: Post the weekly performance leaderboard to Telegram."""
-    logger.info("[Weekly Leaderboard] Started at %s", datetime.now().isoformat())
-    post_leaderboard(db, config)
-    logger.info("[Weekly Leaderboard] Finished at %s", datetime.now().isoformat())
-
-
 def start_scheduler(db, config) -> None:
-    """Configure and start the blocking APScheduler with all three jobs."""
+    """Configure and start the blocking APScheduler with all jobs."""
     scheduler = BlockingScheduler(timezone=_TZ)
 
     scheduler.add_job(
-        run_outcome_updater,
+        run_performance_updater,
         CronTrigger(hour=8, minute=0, timezone=_TZ),
         args=[db],
-        name="outcome_updater",
-        id="outcome_updater",
+        name="performance_updater",
+        id="performance_updater",
     )
 
     scheduler.add_job(
@@ -220,14 +194,6 @@ def start_scheduler(db, config) -> None:
         args=[db, config],
         name="daily_pipeline",
         id="daily_pipeline",
-    )
-
-    scheduler.add_job(
-        run_weekly_leaderboard,
-        CronTrigger(day_of_week="mon", hour=9, minute=5, timezone=_TZ),
-        args=[db, config],
-        name="weekly_leaderboard",
-        id="weekly_leaderboard",
     )
 
     logger.info(
