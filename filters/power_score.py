@@ -46,15 +46,21 @@ _POWER_SCORES: dict[str, int] = {
     "Jodey Arrington":          12,   # Chair, House Budget
     "Sam Graves":               12,   # Chair, House Transportation
     "Brian Babin":              12,   # Chair, House Science, Space & Tech
+    "Brian Mast":               16,   # Chair, House Foreign Affairs (119th Congress)
 
     # ── Ranking members ────────────────────────────────────────────────────
     "Debbie Wasserman Schultz": 10,   # Ranking, House Appropriations subcommittee
+    "Donald Norcross":          10,   # Ranking Member, House Armed Services subcommittee
 
     # ── Still serving, former formal leadership ───────────────────────────
     # NBER 2025 paper is about *current* agenda-setting power. Experimental
     # 3 pts for network/institutional influence that may persist post-role.
     "Nancy Pelosi":              3,   # Former Speaker, still serving
     "Mitch McConnell":           3,   # Former Senate Majority Leader, still serving
+
+    # ── Still serving, former committee chairs (8 pts per scoring rubric) ──
+    "Michael McCaul":            8,   # Former Chair, House Foreign Affairs (118th Congress)
+    "Josh Gottheimer":           5,   # Co-chair, Problem Solvers Caucus (bipartisan influence)
 
     # ── No longer serving — score zero ────────────────────────────────────
     # Kevin McCarthy resigned Dec 2023; former chairs retired.
