@@ -10,9 +10,10 @@ Research-informed design (see RESEARCH_BRIEF.md):
    a politician who normally files $1K buys is high-conviction; a $15K trade
    from someone who routinely files $100K+ is noise.
 
-3. Basket likelihood replaces the binary bulk-filing flag. We score how
-   concentrated a trade is (1-2 tickers that day = conviction) vs how broad
-   (10+ tickers = rebalancing) using a 0–3 continuous score.
+3. Basket scoring is sector-aware, not just count-based. Research (Wei & Zhou
+   NBER 2025, GovGreed) shows alpha concentrates in sector-specific bets, not
+   diversified rebalancing. 10 semiconductor buys = sector thesis (score 1);
+   10 buys across healthcare/utilities/tech/financials = rebalancing (score 3).
 
 4. Entry assessment uses the DISCLOSURE DATE (filing_date) as the primary
    clock, not the execution date. Lazzaretto (2024) found alpha accrues after
@@ -26,7 +27,7 @@ Research-informed design (see RESEARCH_BRIEF.md):
 import logging
 import re
 from datetime import date, datetime, timedelta
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 logger = logging.getLogger(__name__)
 
@@ -97,14 +98,42 @@ def _size_band_to_dollars(band: int) -> int:
     return mapping.get(band, 0)
 
 # ---------------------------------------------------------------------------
+# Sector lookup (cached per pipeline run)
+# ---------------------------------------------------------------------------
+
+_sector_cache: dict[str, str] = {}
+
+
+def _get_sector(ticker: str) -> str:
+    """Return GICS sector for a ticker; cached for the lifetime of the pipeline run."""
+    if ticker in _sector_cache:
+        return _sector_cache[ticker]
+    try:
+        import yfinance as yf
+        sector = yf.Ticker(ticker).info.get("sector", "Unknown") or "Unknown"
+    except Exception:
+        sector = "Unknown"
+    _sector_cache[ticker] = sector
+    return sector
+
+
+# ---------------------------------------------------------------------------
 # Structured feature computation
 # ---------------------------------------------------------------------------
 
 def _compute_basket_score(trade: dict, all_candidates: list[dict]) -> int:
-    """Score how concentrated this trade is vs a broad basket (0=concentrated, 3=basket).
+    """Score trade concentration vs broad rebalancing (0=conviction, 3=basket).
 
-    Uses the NUMBER OF UNIQUE TICKERS traded by this politician on the same
-    trade_date (not filing_date — avoids penalising late-filing batches).
+    Count-only thresholds are too aggressive: Ro Khanna's MU (+79%) and UCTT
+    (+154%) trades were batch-filed alongside other positions. A 10-semiconductor
+    buy cluster is a sector thesis; a 10-buy cluster spanning healthcare/utilities/
+    tech/financials is routine rebalancing. We use sector diversity to distinguish.
+
+    Scoring:
+      0 — 1–3 tickers: concentrated conviction bet
+      1 — 4–7 tickers, OR 8–20 tickers with ≥70% in 1–2 sectors: sector thesis
+      2 — 8–20 tickers with ambiguous or missing sector data
+      3 — 21+ tickers, OR 8–20 tickers spread across 3+ unrelated sectors
     """
     pol        = trade.get("politician_name", "")
     trade_date = trade.get("trade_date", "")
@@ -114,10 +143,30 @@ def _compute_basket_score(trade: dict, all_candidates: list[dict]) -> int:
         and t.get("trade_date") == trade_date
     ]
     n = len(same_day)
-    if n <= 2:   return 0   # concentrated conviction bet
-    if n <= 4:   return 1   # small cluster, some rebalancing possible
-    if n <= 8:   return 2   # likely rebalancing
-    return 3                # broad basket — routine rebalancing
+
+    if n <= 3:   return 0   # concentrated conviction bet
+    if n <= 7:   return 1   # small cluster
+
+    if n > 20:   return 3   # always rebalancing at this scale
+
+    # 8–20 tickers: sector diversity determines signal vs. noise
+    tickers = [t.get("ticker") for t in same_day if t.get("ticker")]
+    if len(tickers) >= 4:
+        sector_counts = Counter(_get_sector(t) for t in tickers)
+        sector_counts.pop("Unknown", None)
+        if sector_counts:
+            total_known = sum(sector_counts.values())
+            top_count   = sector_counts.most_common(1)[0][1]
+            top_pct     = top_count / total_known
+            num_sectors = len(sector_counts)
+
+            if top_pct >= 0.70 and num_sectors <= 2:
+                return 1   # sector-concentrated thesis
+
+            if num_sectors >= 3:
+                return 3   # diversified across unrelated sectors = rebalancing
+
+    return 2   # ambiguous — moderate cluster, no sector data
 
 
 def _compute_relative_size_score(trade: dict, history: list[dict]) -> float:

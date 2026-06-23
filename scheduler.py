@@ -18,6 +18,7 @@ from filters.screener import filter_trades
 from scorer.signal import score_trade
 from alerts.telegram import send_trade_alert
 from performance.tracker import update_alert_prices, get_spy_price_now
+from performance.leaderboard import post_leaderboard
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +88,17 @@ def run_performance_updater(db) -> None:
     logger.info("[Performance Updater] Started at %s", datetime.now().isoformat())
     updated = update_alert_prices(db)
     logger.info("[Performance Updater] Finished — %d alerts updated", updated)
+
+
+# Alias used by main.py --update-outcomes CLI flag
+run_outcome_updater = run_performance_updater
+
+
+def run_weekly_leaderboard(db, config) -> None:
+    """Job 3: Post the weekly leaderboard to Telegram (Mondays 09:05 ET)."""
+    logger.info("[Weekly Leaderboard] Started at %s", datetime.now().isoformat())
+    post_leaderboard(db, config)
+    logger.info("[Weekly Leaderboard] Finished")
 
 
 def run_daily_pipeline(db, config) -> None:
@@ -194,6 +206,14 @@ def start_scheduler(db, config) -> None:
         args=[db, config],
         name="daily_pipeline",
         id="daily_pipeline",
+    )
+
+    scheduler.add_job(
+        run_weekly_leaderboard,
+        CronTrigger(day_of_week="mon", hour=9, minute=5, timezone=_TZ),
+        args=[db, config],
+        name="weekly_leaderboard",
+        id="weekly_leaderboard",
     )
 
     logger.info(
