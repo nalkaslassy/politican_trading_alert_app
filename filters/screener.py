@@ -423,8 +423,8 @@ def _score_to_strength(score: int, basket_score: int,
     if basket_score >= 3:
         return "weak"   # broad portfolio event — not a conviction signal
 
-    if freshness_pts < 10:
-        return "weak"   # too stale regardless of other scores
+    if freshness_pts < 5:
+        return "weak"   # beyond 21 trading days — unreachable given filter gate, but safety check
 
     if score >= 65 and power_pts >= 22:
         return "strong"
