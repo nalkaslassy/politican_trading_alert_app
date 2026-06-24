@@ -248,7 +248,7 @@ class Database:
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT trade_type, COUNT(*) as cnt FROM all_trades "
-                "WHERE politician_name = ? AND ticker = ? AND trade_date >= ? "
+                "WHERE politician_name = ? AND ticker = ? AND created_at >= ? "
                 "GROUP BY trade_type",
                 (politician_name, ticker, cutoff),
             ).fetchall()

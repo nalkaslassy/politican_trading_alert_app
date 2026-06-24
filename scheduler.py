@@ -108,7 +108,7 @@ def run_daily_pipeline(db, config) -> None:
       1. Scrape all pages within max_trade_age_days window.
       2. Filter: score buys using power/influence + committee + owner type.
          - Sells stored to DB silently (no Telegram — evidence too ambiguous).
-         - Structured score gates: strong ≥55, moderate ≥35.
+         - Structured score gates: strong ≥65 (power≥22), moderate ≥35.
          - Basket likelihood handles rebalancing noise.
          - Disclosure-date entry assessment (Lazzaretto 2024).
       3. Gate + cap BEFORE Claude — only call API on trades that will alert.

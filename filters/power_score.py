@@ -92,10 +92,10 @@ def get_power_score(politician_name: str) -> tuple[int, str]:
     """
     score = _POWER_SCORES.get(politician_name, _DEFAULT_SCORE)
 
-    if score >= 26:
-        note = f"{politician_name}: Formal congressional leadership"
-    elif score == 28:
+    if score == 28:
         note = f"{politician_name}: Speaker of the House"
+    elif score >= 26:
+        note = f"{politician_name}: Formal congressional leadership"
     elif score >= 22:
         note = f"{politician_name}: Senior leadership / Whip"
     elif score >= 16:
