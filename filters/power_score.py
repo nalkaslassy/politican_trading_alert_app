@@ -53,17 +53,25 @@ _POWER_SCORES: dict[str, int] = {
     "Donald Norcross":          10,   # Ranking Member, House Armed Services subcommittee
 
     # ── Still serving, former formal leadership ───────────────────────────
-    # NBER 2025 paper is about *current* agenda-setting power. Experimental
-    # 3 pts for network/institutional influence that may persist post-role.
-    "Nancy Pelosi":              3,   # Former Speaker, still serving
+    "Nancy Pelosi":             10,   # Former Speaker; 87% documented win rate, 40yr network — persistent alpha evidence
     "Mitch McConnell":           3,   # Former Senate Majority Leader, still serving
 
-    # ── Still serving, former committee chairs (8 pts per scoring rubric) ──
+    # ── Still serving, former committee chairs ────────────────────────────
     "Michael McCaul":            8,   # Former Chair, House Foreign Affairs (118th Congress)
     "Josh Gottheimer":           5,   # Co-chair, Problem Solvers Caucus (bipartisan influence)
 
+    # ── Empirically documented top performers (track record = secondary evidence) ──
+    # Win rates and returns from GovGreed / Capitol Trades 2025 rankings.
+    # 8 pts = same as former committee chair; enough to reach "moderate" on a
+    # fresh, concentrated trade with contractor or committee sector overlap.
+    "Warren Davidson":          10,   # #1 performer 2025 (+78.8%); concentrated thesis-based trades
+    "Terri Sewell":             10,   # #3 performer 2025 (+67.9%); consistent documented outperformer
+    "Nick LaLota":               5,   # #6 performer 2025 (+61.5%)
+    "Rick Scott":                5,   # #7 performer 2025 (+54.8%); Senate Armed Services / Budget access
+    "Dan Crenshaw":              5,   # Intelligence Committee access; active trader
+    "Tommy Tuberville":          5,   # Armed Services + Agriculture committees; active trader
+
     # ── No longer serving — score zero ────────────────────────────────────
-    # Kevin McCarthy resigned Dec 2023; former chairs retired.
     "Kevin McCarthy":            0,
     "Patrick McHenry":           0,
     "Richard Burr":              0,
