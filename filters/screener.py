@@ -414,13 +414,10 @@ def _score_to_strength(score: int, basket_score: int,
     """Map structured score to signal_strength tier.
 
     Tiers:
-      strong       — 65+ AND top leadership (power≥22). GICS proxy cannot
-                     substitute for verified political influence. Per NBER 2025
-                     and Belmont 2022, only formal leaders show reliable alpha.
-      high_moderate— 65+ but without top leadership. Score is high but built on
-                     proxy factors (sector overlap, contractor status). Interesting
-                     but unverified at issuer-specific level.
-      moderate     — 45–64 with meaningful power or committee relevance.
+      strong       — 65+ AND top leadership (power≥22).
+      high_moderate— 65+ without top leadership.
+      moderate     — 35+ with any power (≥5) OR any committee overlap (≥5 pts = 1 matching committee).
+                     Covers ~40 politicians with mapped committees or scored power.
       weak         — everything else.
     """
     if basket_score >= 3:
@@ -433,9 +430,9 @@ def _score_to_strength(score: int, basket_score: int,
         return "strong"
 
     if score >= 65:
-        return "high_moderate"   # high score, but no verified leadership signal
+        return "high_moderate"
 
-    if score >= 45 and (power_pts >= 8 or committee_pts >= 10):
+    if score >= 35 and (power_pts >= 5 or committee_pts >= 5):
         return "moderate"
 
     return "weak"
