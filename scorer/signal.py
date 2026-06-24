@@ -17,7 +17,20 @@ import anthropic
 
 logger = logging.getLogger(__name__)
 
-_MODEL = "claude-sonnet-4-6"
+# Haiku is sufficient for structured JSON generation (1 sentence + sector label).
+# ~10x cheaper than Sonnet with no quality loss for this task.
+_MODEL = "claude-haiku-4-5-20251001"
+
+# Module-level singleton — avoids re-initialising the HTTP client on every alert.
+_client: anthropic.Anthropic | None = None
+
+
+def _get_client(api_key: str) -> anthropic.Anthropic:
+    global _client
+    if _client is None:
+        _client = anthropic.Anthropic(api_key=api_key)
+    return _client
+
 
 _SYSTEM_PROMPT = (
     "You are a financial signal analyst for Capitol Radar, a congressional trade "
@@ -85,10 +98,10 @@ def score_trade(trade: dict, stats: dict | None, config: dict) -> dict:
     trade = dict(trade)
 
     try:
-        client = anthropic.Anthropic(api_key=config["anthropic_api_key"])
+        client = _get_client(config["anthropic_api_key"])
         message = client.messages.create(
             model=_MODEL,
-            max_tokens=300,
+            max_tokens=150,
             system=_SYSTEM_PROMPT,
             messages=[
                 {"role": "user", "content": _build_narrative_prompt(trade, stats)}
