@@ -416,8 +416,8 @@ def _score_to_strength(score: int, basket_score: int,
     Tiers:
       strong       — 65+ AND top leadership (power≥22).
       high_moderate— 65+ without top leadership.
-      moderate     — 35+ with any power (≥5) OR any committee overlap (≥5 pts = 1 matching committee).
-                     Covers ~40 politicians with mapped committees or scored power.
+      moderate     — 45+ with any power (≥5) OR any committee overlap (≥5 pts).
+                     Raised from 35 to cut low-conviction borderline trades.
       weak         — everything else.
     """
     if basket_score >= 3:
@@ -432,7 +432,7 @@ def _score_to_strength(score: int, basket_score: int,
     if score >= 65:
         return "high_moderate"
 
-    if score >= 35 and (power_pts >= 5 or committee_pts >= 5):
+    if score >= 45 and (power_pts >= 5 or committee_pts >= 5):
         return "moderate"
 
     return "weak"
