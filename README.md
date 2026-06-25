@@ -2,78 +2,98 @@
 
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Capitol Radar monitors congressional stock trade disclosures, filters them against a configurable watchlist of high-signal politicians, and fires real-time Telegram alerts scored by Claude AI. It tracks every alerted buy's performance over 30 and 60 days, automatically building a win-rate leaderboard, and posts it to your Telegram channel every Monday.
+Capitol Radar monitors congressional STOCK Act trade disclosures, scores them using a research-backed algorithmic model, and fires Telegram alerts when a credentialed politician makes a high-conviction buy. Claude AI writes the human-readable narrative — it does **not** determine signal quality. All scoring is deterministic and auditable.
 
 ---
 
 ## How It Works
 
 ```
-Scrape → Filter → Alpha Check → Score → Alert
+Scrape → Filter & Score (algorithm) → Claude narrative → Telegram alert
 ```
 
-1. **Scrape** — Capitol Radar polls [capitoltrades.com](https://www.capitoltrades.com/trades) for new congressional trade filings.
-2. **Filter** — Trades are screened: only Buys, valid tickers, and size ≥ $15,001 proceed.
-3. **Alpha Check** — The trade is tested against your chosen watchlist mode (see below). Non-watchlist trades are still stored silently for performance tracking.
-4. **Score** — Claude Haiku analyses the trade in the context of the politician's historical track record and returns a signal strength (`strong` / `moderate` / `weak`), sector, and one-line reasoning.
-5. **Alert** — A formatted message is sent to your Telegram chat or channel.
+1. **Scrape** — Polls [capitoltrades.com](https://www.capitoltrades.com/trades) daily via headless Chrome. Stops pagination once trades age beyond 90 days.
+2. **Score** — Every buy trade receives a structured 0–100 score across 7 components (see below). Sells are stored silently.
+3. **Gate** — Trade must score ≥45 AND have a credential (power≥5 pts OR committee≥5 pts). Basket rebalancing events and stale disclosures (>21 trading days) are suppressed.
+4. **Entry check** — Live price fetched via yfinance. If stock has moved >3× ATR since disclosure, the alert is blocked — opportunity has passed.
+5. **Narrative** — Claude Haiku writes a one-sentence reasoning and risk note in JSON. It receives the pre-computed score; it cannot change it.
+6. **Alert** — Formatted Telegram message with trade date, entry price, disclosure gap, score breakdown, and ATR movement.
 
-**Background jobs (run automatically):**
-
-- **Outcome Tracker** (daily 8:00am ET) — fetches closing prices via yfinance at 30 and 60 days post-trade, records `win` / `loss`, and recalculates each politician's win rate.
-- **Weekly Leaderboard** (every Monday 9:05am ET) — posts a ranked Telegram message of the top 10 politicians by 30-day win rate.
-
----
-
-## Watchlist Modes
-
-| Mode | Behaviour |
-|------|-----------|
-| `strict` | Only alert on politicians explicitly listed in `watchlist_politicians`. Best for getting started with known high-performers. |
-| `dynamic` | Alert on any politician who has accumulated ≥ `min_trades_for_dynamic` tracked buys **and** a win rate ≥ `min_win_rate`. Requires ~60 days of data to be meaningful. |
-| `all` | Alert on every qualifying trade regardless of who made it. Use with caution — high volume. |
+**Background jobs:**
+- **Outcome updater** (daily 8:00 AM ET) — fetches 7/30/60/90-day forward prices for all alerted trades
+- **Weekly leaderboard** (Monday 9:05 AM ET) — posts a win-rate ranking to Telegram
 
 ---
 
-## Telegram Setup
+## Scoring Model (0–100)
 
-### 1. Create a bot (BotFather)
-1. Open Telegram and search for `@BotFather`.
-2. Send `/newbot` and follow the prompts.
-3. Copy the **bot token** (looks like `123456:ABC-DEF...`).
+| Component | Max pts | Source |
+|-----------|---------|--------|
+| Power / influence | 28 | NBER 2025 — alpha concentrated in formal leaders |
+| Committee × sector overlap | 15 | Dong & Xu 2025 — sector-relevant committee buys outperform |
+| Disclosure freshness | 20 | Lazzaretto 2024 — alpha fades after ~21 trading days |
+| Federal contractor exposure | 12 | NBER 2025 — leaders buy firms that win contracts |
+| Repeat buying (direction-aware) | 6 | Lazzaretto 2024 — accumulation > one-off |
+| Owner type (Spouse/Self/Dependent) | 5 | Karadas — spouse accounts show edge |
+| Basket concentration | 5 | Tiebreaker — concentrated bet vs. broad rebalancing |
 
-### 2. Find your personal Chat ID (userinfobot)
-1. Search for `@userinfobot` and send `/start`.
-2. It replies with your numeric chat ID (e.g. `987654321`).
-3. Use this as `telegram_chat_id` for direct/testing mode.
-
-### 3. Set up a public channel (production)
-1. Create a channel in Telegram → Settings → Channel type → Public.
-2. Add your bot as an **Administrator** with "Post Messages" permission.
-3. Use the channel's `@username` or numeric ID as `telegram_chat_id`.
-4. Set `telegram_mode: "channel"` in your config.
+**Signal tiers:**
+- `strong` — score ≥65 AND power ≥22 (top congressional leadership)
+- `high_moderate` — score ≥65, no top leadership requirement
+- `moderate` — score ≥45 AND (power ≥5 OR committee ≥5 pts)
+- `weak` — everything else (suppressed, stored only)
 
 ---
 
-## Self-Hosting Setup
+## Power Score Reference
+
+Formal agenda-setting roles only — seniority without a leadership role has no validated alpha per NBER 2025.
+
+| Score | Role |
+|-------|------|
+| 28 | Speaker of the House |
+| 26 | Senate/House Majority or Minority Leader |
+| 22 | Whip, Conference/Caucus Chair, President Pro Tem |
+| 16 | Major committee Chair (Armed Services, Intelligence, Finance…) |
+| 12 | Other committee Chair |
+| 10 | Ranking Member; former Speaker with documented track record |
+| 5–8 | Empirically documented top performers (2025 rankings) |
+| 0 | Regular member — no validated informational edge |
+
+---
+
+## Data Validation
+
+Every trade passes a STOCK Act compliance check before scoring:
+- `filing_date < trade_date` → **data error, skipped** (CapitolTrades parsing issue)
+- `filing_date − trade_date > 45 days` → **late filer flagged** in log (legal but noted)
+- Ticker not matching `^[A-Z]{1,5}$` → dropped
+- yfinance returns no price data → dropped (delisted/invalid)
+
+---
+
+## Setup (Windows)
 
 ```bash
-# 1. Clone the repo
+# 1. Clone
 git clone https://github.com/nalkaslassy/politican_trading_alert_app.git
-cd politican_trading_alert_app
+cd politican_trading_alert_app/capitol-radar
 
-# 2. Create your config
+# 2. Install dependencies
+pip install -r requirements.txt
+
+# 3. Configure
 cp config.example.yaml config.yaml
-# Edit config.yaml — add your Anthropic API key, Telegram bot token, and chat ID
+# Fill in: anthropic_api_key, telegram_bot_token, telegram_chat_id
 
-# 3. Run with Docker
-docker-compose up -d
+# 4. Test immediately
+python main.py --run-now
 
-# 4. Test the pipeline immediately
-docker-compose exec capitol-radar python main.py --run-now
+# 5. Start the scheduler
+python main.py
 ```
 
-> **Data persistence** — the SQLite database lives in `./data/` which is mounted as a Docker volume. Your trade history and stats survive restarts.
+**Auto-start on Windows login:** place `CapitolRadar.bat` in your Startup folder (`shell:startup`). The BAT file includes an auto-restart loop — if the scheduler crashes it relaunches after 60 seconds.
 
 ---
 
@@ -81,33 +101,34 @@ docker-compose exec capitol-radar python main.py --run-now
 
 | Command | Description |
 |---------|-------------|
-| `python main.py` | Start the scheduler (default mode) |
-| `python main.py --run-now` | Run the full scrape → filter → score → alert pipeline immediately |
-| `python main.py --update-outcomes` | Fetch latest price data and update win/loss records immediately |
+| `python main.py` | Start the scheduler (Mon–Fri 9 AM ET) |
+| `python main.py --run-now` | Run the full pipeline immediately |
+| `python main.py --update-outcomes` | Update forward prices for all alerted trades |
 | `python main.py --leaderboard` | Post the leaderboard to Telegram immediately |
-| `python main.py --config /path/to/config.yaml` | Use a custom config file path |
+| `python backtest.py` | Backtest current criteria against stored historical trades |
+| `python resend_alerts.py` | Resend moderate/strong alerts with fresh prices |
+| `python resend_alerts.py PLTR ALB` | Resend specific tickers only |
 
 ---
 
-## Scaling Up
+## Configuration (`config.yaml`)
 
-### Phase 1 — Personal Alerts (Week 1)
-Set `telegram_mode: "direct"` and `watchlist_mode: "strict"`. Start with the 8 politicians in `config.example.yaml`. You receive personal Telegram alerts for their buys.
+```yaml
+anthropic_api_key: "..."
+telegram_bot_token: "..."
+telegram_chat_id: "..."          # your Telegram user ID or channel ID
+telegram_mode: "direct"          # "direct" or "channel"
 
-### Phase 2 — Public Channel (Week 2+)
-Switch to `telegram_mode: "channel"`. Point `telegram_chat_id` at your public channel username. Share the channel link anywhere you like — alerts are broadcast to all subscribers automatically.
+watchlist_mode: "all"            # "all" | "strict" | "dynamic"
+min_signal_strength: "moderate"  # alert threshold: "strong" | "moderate" | "weak"
+max_alerts_per_politician: 3     # cap per politician per pipeline run
+max_trade_age_days: 90           # ignore trades older than this
+max_trading_days_since_disclosure: 21  # ignore stale filings
+scrape_pages_hard_cap: 50
 
-### Phase 3 — Dynamic Mode (Day 60+)
-Once you have ~60 days of performance data, switch to `watchlist_mode: "dynamic"`. Capitol Radar promotes any politician who clears your win-rate threshold automatically, and stops alerting ones whose edge dries up — no manual list maintenance.
-
-### Phase 4 — SMS Paid Tier
-See the `TODO` comment in [alerts/telegram.py](alerts/telegram.py). Integrate Plivo (or Twilio) to offer SMS alerts to paid subscribers. Subscribers who opt in receive the same scored signals as a text message.
-
----
-
-## Hosted Version
-
-> A hosted version of Capitol Radar with a managed Telegram channel is planned. Subscribe to get notified when it launches: _coming soon_.
+db_path: "./data/capitol_radar.db"
+log_level: "INFO"
+```
 
 ---
 
@@ -115,34 +136,55 @@ See the `TODO` comment in [alerts/telegram.py](alerts/telegram.py). Integrate Pl
 
 ```
 capitol-radar/
-├── main.py                 Entry point — CLI flags + scheduler start
-├── scheduler.py            APScheduler job definitions
+├── main.py                      Entry point — CLI flags + scheduler start
+├── scheduler.py                 APScheduler job definitions (3 jobs)
+├── backtest.py                  Backtest scoring criteria against stored history
+├── resend_alerts.py             Manually resend alerts with fresh prices
 ├── scraper/
-│   └── capitol_trades.py   Polls capitoltrades.com for new filings
+│   └── capitol_trades.py        Headless Chrome scraper for capitoltrades.com
 ├── filters/
-│   └── screener.py         Filters by trade type, size, alpha list
+│   ├── screener.py              Main filter + structured scoring pipeline
+│   ├── power_score.py           Formal leadership power scores (0–28)
+│   ├── committee_overlap.py     Committee × sector relevance scoring (0–15)
+│   └── contractor_score.py      USAspending.gov federal contractor lookup (0–12)
 ├── scorer/
-│   └── signal.py           Claude Haiku scores each signal
+│   └── signal.py                Claude Haiku narrative generation (JSON only)
 ├── performance/
-│   ├── tracker.py          Fetches prices and calculates outcomes
-│   └── leaderboard.py      Ranks politicians by win rate
+│   ├── tracker.py               Forward price fetcher (7/30/60/90d)
+│   └── leaderboard.py           Weekly win-rate leaderboard
 ├── alerts/
-│   └── telegram.py         Sends Telegram alerts
+│   └── telegram.py              Telegram Bot API dispatcher
 ├── storage/
-│   └── db.py               SQLite layer (no ORM)
-├── config.example.yaml     Config template
-├── Dockerfile
-└── docker-compose.yml
+│   └── db.py                    SQLite layer — no ORM
+├── config.example.yaml
+└── requirements.txt
 ```
+
+---
+
+## Backtesting
+
+```bash
+python backtest.py               # test current criteria against all stored buys
+python backtest.py --combo high_power   # only formal leadership trades
+python backtest.py --min-date 2026-01-01
+```
+
+Re-scores every Buy trade in the DB using live scoring logic (freshness set to maximum to simulate day-0 detection), fetches actual 30/60/90-day returns via yfinance, and reports win rate and alpha vs SPY.
+
+---
+
+## Expected Alert Frequency
+
+Congressional filings are irregular. Expect:
+- **Active weeks:** 3–8 alerts
+- **Quiet weeks / recess:** 0–2 alerts
+- **Batch filing days:** 5–12 alerts in one run, then quiet
+
+Alerts are intentionally sparse — the gate is designed to fire only when a credentialed politician makes a fresh, concentrated, sector-relevant buy that still has a clean entry point.
 
 ---
 
 ## License
 
 MIT © 2026
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
