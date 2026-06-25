@@ -34,13 +34,22 @@ def _load_config(config_path: Path) -> dict:
 
 
 def _setup_logging(level_str: str) -> None:
-    """Configure root logger with timestamp and level from config."""
+    """Configure root logger to write to both stderr and scheduler.log."""
     level = getattr(logging, level_str.upper(), logging.INFO)
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+    root = logging.getLogger()
+    root.setLevel(level)
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(fmt)
+    root.addHandler(stream_handler)
+
+    file_handler = logging.FileHandler("scheduler.log", encoding="utf-8")
+    file_handler.setFormatter(fmt)
+    root.addHandler(file_handler)
 
 
 def main() -> None:
