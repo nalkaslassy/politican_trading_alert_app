@@ -502,6 +502,27 @@ def filter_trades(
             store_only.append(trade)
             continue
 
+        # STOCK Act data sanity check — filing must come after the trade
+        # (STOCK Act requires disclosure within 45 days; >45 days is a late filer)
+        pol_name = trade.get("politician_name", "")
+        if trade_dt and filing_dt:
+            gap_days = (filing_dt - trade_dt).days
+            if gap_days < 0:
+                # Filing date before trade date — data error from source
+                logger.warning(
+                    "DATA ERROR: filing_date (%s) is before trade_date (%s) "
+                    "for %s %s — skipping", filing_dt, trade_dt, pol_name, ticker
+                )
+                store_only.append(trade)
+                continue
+            trade["_disclosure_gap_days"] = gap_days
+            if gap_days > 45:
+                # Legal (incurs a fine), but worth logging
+                logger.info(
+                    "LATE FILER: %s %s filed %d days after trade (STOCK Act limit: 45)",
+                    pol_name, ticker, gap_days
+                )
+
         # ── Structured scoring ──────────────────────────────────────────
         candidate_pool = all_buys if is_buy else all_sells
         basket_score   = _compute_basket_score(trade, candidate_pool)

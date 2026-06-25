@@ -1,14 +1,21 @@
-"""Backtest Capitol Radar signal criteria against 12 months of historical trades.
+"""Backtest Capitol Radar signal criteria against stored historical trades.
 
-For every historical buy that would have passed each filter combination, computes:
+For every historical buy that would have passed the current live criteria,
+computes:
   - Return at 7 / 30 / 60 / 90 days after disclosure date
   - SPY return over the same window (alpha = trade return - SPY return)
   - Win rate: % of trades that beat SPY at the 30-day mark
 
+Uses the ACTUAL live scoring logic (filters/screener.py, power_score.py,
+committee_overlap.py) so results reflect what the system would genuinely
+have alerted. Contractor scores are skipped (set to 0) for speed — this
+slightly underestimates scores but does not change the gate outcome for
+high-power/committee trades.
+
 Usage:
   python backtest.py               # full analysis, all filter combos
-  python backtest.py --combo spouse_committee  # one specific combo
-  python backtest.py --min-date 2025-01-01     # restrict date range
+  python backtest.py --combo current_live   # just the live criteria
+  python backtest.py --min-date 2026-04-01  # restrict date range
 """
 
 import argparse
@@ -41,75 +48,6 @@ except ImportError:
 
 
 # ── constants ────────────────────────────────────────────────────────────────
-
-_SIZE_BANDS = {"1m":7,"500k":6,"250k":5,"100k":4,"50k":3,"15k":2,"1k":1,"<1k":0}
-
-_OWNER_WEIGHT = {"Spouse": 3, "Self": 2, "Dependent": 1, "Unknown": 0}
-
-_COMMITTEE_SECTORS = {
-    "Armed Services":           ["Industrials","Information Technology","Aerospace & Defense"],
-    "Intelligence":             ["Information Technology","Industrials","Communication Services"],
-    "Financial Services":       ["Financials","Real Estate"],
-    "Banking":                  ["Financials","Real Estate"],
-    "Energy and Commerce":      ["Energy","Health Care","Communication Services","Information Technology"],
-    "Ways and Means":           ["Health Care","Financials","Consumer Discretionary"],
-    "Foreign Affairs":          ["Industrials","Materials","Energy"],
-    "Agriculture":              ["Consumer Staples","Materials"],
-    "Science Space Technology": ["Information Technology","Energy","Industrials"],
-    "Homeland Security":        ["Information Technology","Industrials"],
-    "Judiciary":                ["Information Technology","Communication Services"],
-    "Commerce":                 ["Consumer Discretionary","Information Technology","Industrials"],
-    "Appropriations":           ["Industrials","Health Care","Information Technology"],
-    "Budget":                   ["Financials"],
-    "Oversight":                ["Information Technology","Industrials","Health Care"],
-    "Transportation":           ["Industrials","Energy","Consumer Discretionary"],
-}
-
-_POLITICIAN_COMMITTEES = {
-    "Nancy Pelosi":             ["Appropriations","Oversight"],
-    "Michael McCaul":           ["Foreign Affairs","Science Space Technology"],
-    "Ro Khanna":                ["Armed Services","Oversight","Science Space Technology"],
-    "Dan Crenshaw":             ["Intelligence","Homeland Security"],
-    "Brian Mast":               ["Foreign Affairs","Transportation"],
-    "Josh Gottheimer":          ["Financial Services","Homeland Security"],
-    "Tommy Tuberville":         ["Armed Services","Agriculture"],
-    "Warren Davidson":          ["Financial Services"],
-    "Rick Scott":               ["Banking","Budget","Commerce"],
-    "Nick LaLota":              ["Financial Services","Homeland Security"],
-    "Marjorie Taylor Greene":   ["Budget","Oversight"],
-    "Donald Norcross":          ["Armed Services","Transportation"],
-    "Terri Sewell":             ["Ways and Means"],
-    "David Rouzer":             ["Agriculture","Transportation"],
-    "John Boozman":             ["Agriculture","Appropriations","Banking"],
-    "John Fetterman":           ["Agriculture","Banking","Judiciary"],
-    "Gary Peters":              ["Armed Services","Homeland Security","Commerce"],
-    "Steve Cohen":              ["Judiciary","Transportation"],
-    "Mike Kelly":               ["Ways and Means","Oversight"],
-    "John McGuire":             ["Armed Services"],
-    "Nicholas Begich III":      ["Armed Services","Transportation"],
-    "Rick Allen":               ["Agriculture","Budget"],
-    "Thomas Kean Jr":           ["Science Space Technology","Homeland Security"],
-    "Debbie Wasserman Schultz": ["Appropriations"],
-    "Kevin Hern":               ["Ways and Means","Budget"],
-    "Andy Barr":                ["Financial Services"],
-    "French Hill":              ["Financial Services","Intelligence"],
-    "Bill Foster":              ["Financial Services","Science Space Technology"],
-    "Patrick McHenry":          ["Financial Services"],
-    "Jared Moskowitz":          ["Appropriations","Oversight"],
-    "Jonathan Jackson":         ["Oversight"],
-    "Chip Roy":                 ["Budget","Oversight"],
-    "David Taylor":             ["Financial Services","Oversight"],
-}
-
-_SECTOR_ALIASES = {
-    "technology":             "Information Technology",
-    "financial":              "Financials",
-    "healthcare":             "Health Care",
-    "health care":            "Health Care",
-    "consumer defensive":     "Consumer Staples",
-    "consumer cyclical":      "Consumer Discretionary",
-    "basic materials":        "Materials",
-}
 
 _HOLD_DAYS = [7, 30, 60, 90]
 _BENCHMARK  = "SPY"
@@ -191,116 +129,80 @@ def _get_sector(ticker: str) -> Optional[str]:
     return _sector_cache[ticker]
 
 
-# ── scoring ───────────────────────────────────────────────────────────────────
+# ── scoring — uses live filter modules ───────────────────────────────────────
+# Contractor score is set to 0 to avoid API calls; this slightly underestimates
+# scores but does not change gate outcomes for high-power/committee trades.
 
-def _committee_score(politician: str, ticker: str) -> int:
-    committees = _POLITICIAN_COMMITTEES.get(politician, [])
-    if not committees:
-        return 0
-    sector = _get_sector(ticker)
-    if not sector:
-        return 0
-    matches = [c for c in committees if sector in _COMMITTEE_SECTORS.get(c, [])]
-    if len(matches) >= 2:
-        return 3
-    if len(matches) == 1:
-        return 2
-    # Adjacent check
-    adjacent = {
-        "Information Technology": ["Commerce","Oversight","Judiciary"],
-        "Financials":             ["Budget","Oversight"],
-        "Health Care":            ["Oversight","Appropriations"],
-        "Energy":                 ["Appropriations","Science Space Technology"],
-        "Industrials":            ["Appropriations","Transportation"],
-    }
-    for c in committees:
-        if c in adjacent.get(sector, []):
-            return 1
-    return 0
+def _get_trade_score(trade: dict, basket_score: int) -> tuple[int, int, int]:
+    """Return (structured_score, power_pts, committee_pts) using live modules."""
+    from filters.power_score import get_power_score
+    from filters.committee_overlap import get_committee_overlap_score
+    from filters.screener import _compute_structured_score
 
+    pol  = trade.get("politician_name", "")
+    tick = trade.get("ticker", "")
 
-def _size_band(size_str: str) -> int:
-    s = (size_str or "").lower().replace(",","").replace("$","").strip()
-    for key, val in _SIZE_BANDS.items():
-        if key in s:
-            return val
-    return 0
+    power_score, _     = get_power_score(pol)
+    committee_overlap, _ = get_committee_overlap_score(pol, tick)
+
+    power_pts     = min(28, power_score)
+    committee_pts = min(15, committee_overlap * 5)
+
+    score, _ = _compute_structured_score(
+        trade, basket_score, committee_overlap, power_score,
+        prior_buys=0, prior_sells=0,
+        freshness_pts=20,    # assume day-0 detection for historical trades
+        contractor_pts=0,    # skip API calls; slightly underestimates scores
+    )
+    return score, power_pts, committee_pts
 
 
-def _compute_score(trade: dict, committee_pts: int, basket_score: int) -> int:
-    owner   = trade.get("owner_type","Unknown")
-    size    = trade.get("trade_size","")
-
-    owner_pts     = {3:20, 2:15, 1:5, 0:0}[_OWNER_WEIGHT.get(owner, 0)]
-    committee_pts = min(committee_pts * 10, 30)
-    size_pts      = min(_size_band(size) * 3, 25)
-    basket_pts    = {0:15, 1:10, 2:5, 3:0}[min(basket_score, 3)]
-    history_pts   = 5  # no history available for backtest; use neutral
-
-    return committee_pts + owner_pts + size_pts + basket_pts + history_pts
-
-
-def _signal_strength(score: int, basket_score: int) -> str:
-    if basket_score >= 3:
-        return "weak"
-    if score >= 55:
-        return "strong"
-    if score >= 35:
-        return "moderate"
-    return "weak"
+def _signal_strength(score: int, basket_score: int,
+                     power_pts: int, committee_pts: int) -> str:
+    """Current live gate logic."""
+    from filters.screener import _score_to_strength
+    return _score_to_strength(score, basket_score, power_pts, committee_pts, freshness_pts=20)
 
 
 # ── filter definitions ───────────────────────────────────────────────────────
+# Tests different sub-criteria to show which components drive performance.
+# "current_live" is exactly what the live system alerts on.
 
 FILTER_COMBOS = {
-    "all_moderate": {
-        "desc":           "All buys, moderate+ (score ≥35)",
-        "owner_types":    {"Spouse","Self","Dependent","Unknown"},
-        "min_committee":  0,
-        "min_signal":     "moderate",
-        "max_basket":     3,
+    "current_live": {
+        "desc":       "Current live criteria  (score≥35, power≥5 OR committee≥5pts)",
+        "owner_types": {"Spouse", "Self", "Dependent", "Unknown"},
+        "min_signal":  "moderate",
+        "max_basket":  2,
+        "min_power":   0,
     },
-    "no_basket_moderate": {
-        "desc":           "Isolated buys only (basket=0), moderate+",
-        "owner_types":    {"Spouse","Self","Dependent","Unknown"},
-        "min_committee":  0,
-        "min_signal":     "moderate",
-        "max_basket":     0,
+    "high_power": {
+        "desc":       "Power ≥16 only (committee chairs & leadership)",
+        "owner_types": {"Spouse", "Self", "Dependent", "Unknown"},
+        "min_signal":  "moderate",
+        "max_basket":  2,
+        "min_power":   16,
     },
-    "spouse_self_moderate": {
-        "desc":           "Spouse/Self only, moderate+",
-        "owner_types":    {"Spouse","Self"},
-        "min_committee":  0,
-        "min_signal":     "moderate",
-        "max_basket":     3,
+    "concentrated": {
+        "desc":       "Isolated buys only (basket=0), current criteria",
+        "owner_types": {"Spouse", "Self", "Dependent", "Unknown"},
+        "min_signal":  "moderate",
+        "max_basket":  0,
+        "min_power":   0,
     },
-    "committee_moderate": {
-        "desc":           "Committee overlap ≥1, moderate+",
-        "owner_types":    {"Spouse","Self","Dependent","Unknown"},
-        "min_committee":  1,
-        "min_signal":     "moderate",
-        "max_basket":     3,
-    },
-    "spouse_committee": {
-        "desc":           "Spouse/Self + committee overlap ≥1, moderate+",
-        "owner_types":    {"Spouse","Self"},
-        "min_committee":  1,
-        "min_signal":     "moderate",
-        "max_basket":     3,
+    "spouse_self": {
+        "desc":       "Spouse/Self accounts only, current criteria",
+        "owner_types": {"Spouse", "Self"},
+        "min_signal":  "moderate",
+        "max_basket":  2,
+        "min_power":   0,
     },
     "strong_only": {
-        "desc":           "Strong signals only (score ≥55)",
-        "owner_types":    {"Spouse","Self","Dependent","Unknown"},
-        "min_committee":  0,
-        "min_signal":     "strong",
-        "max_basket":     3,
-    },
-    "best": {
-        "desc":           "Spouse/Self + committee ≥1 + isolated (basket=0), moderate+",
-        "owner_types":    {"Spouse","Self"},
-        "min_committee":  1,
-        "min_signal":     "moderate",
-        "max_basket":     0,
+        "desc":       "Strong signals only  (score≥65, power≥22)",
+        "owner_types": {"Spouse", "Self", "Dependent", "Unknown"},
+        "min_signal":  "strong",
+        "max_basket":  2,
+        "min_power":   0,
     },
 }
 
@@ -365,8 +267,11 @@ def run_backtest(trades: list[dict], basket_scores: dict, spy_prices: dict,
     results = []
     skipped_price = 0
 
+    _rank = {"strong": 3, "high_moderate": 2, "moderate": 2, "weak": 1, "unknown": 0}
+    min_rank = _rank.get(combo["min_signal"], 2)
+
     for t in trades:
-        owner = t.get("owner_type","Unknown")
+        owner = t.get("owner_type", "Unknown")
         if owner not in combo["owner_types"]:
             continue
 
@@ -379,16 +284,14 @@ def run_backtest(trades: list[dict], basket_scores: dict, spy_prices: dict,
         if basket > combo["max_basket"]:
             continue
 
-        comm_pts = _committee_score(pol, ticker)
-        if comm_pts < combo["min_committee"]:
+        score, power_pts, committee_pts = _get_trade_score(t, basket)
+        strength = _signal_strength(score, basket, power_pts, committee_pts)
+
+        if _rank.get(strength, 0) < min_rank:
             continue
 
-        score    = _compute_score(t, comm_pts, basket)
-        strength = _signal_strength(score, basket)
-
-        rank = {"strong":3, "moderate":2, "weak":1}
-        min_rank = {"strong":3, "moderate":2, "weak":1}[combo["min_signal"]]
-        if rank[strength] < min_rank:
+        # Optional minimum power filter
+        if power_pts < combo.get("min_power", 0):
             continue
 
         # Fetch prices
@@ -399,31 +302,25 @@ def run_backtest(trades: list[dict], basket_scores: dict, spy_prices: dict,
 
         entry = prices[0]
         row = {
-            "politician": pol,
-            "ticker":     ticker,
-            "owner":      owner,
-            "filing_date":str(fd),
-            "score":      score,
-            "strength":   strength,
-            "basket":     basket,
-            "committee":  comm_pts,
-            "entry_px":   entry,
+            "politician":   pol,
+            "ticker":       ticker,
+            "owner":        owner,
+            "filing_date":  str(fd),
+            "score":        score,
+            "strength":     strength,
+            "basket":       basket,
+            "power_pts":    power_pts,
+            "committee_pts":committee_pts,
+            "entry_px":     entry,
         }
 
         for d in _HOLD_DAYS:
-            px = prices.get(d)
-            spy_px = spy_prices.get(d, {}).get(str(fd))
+            px        = prices.get(d)
+            spy_px    = spy_prices.get(d, {}).get(str(fd))
             spy_entry = spy_prices.get(0, {}).get(str(fd))
 
-            if px is not None and entry > 0:
-                ret = (px - entry) / entry * 100
-            else:
-                ret = None
-
-            if spy_px and spy_entry and spy_entry > 0:
-                spy_ret = (spy_px - spy_entry) / spy_entry * 100
-            else:
-                spy_ret = None
+            ret     = (px - entry) / entry * 100 if (px is not None and entry > 0) else None
+            spy_ret = (spy_px - spy_entry) / spy_entry * 100 if (spy_px and spy_entry and spy_entry > 0) else None
 
             row[f"ret_{d}d"]   = ret
             row[f"spy_{d}d"]   = spy_ret
@@ -475,7 +372,7 @@ def print_summary(all_results: list[dict]) -> None:
 
 def print_top_trades(res: dict, n: int = 15) -> None:
     trades = sorted(res["trades"], key=lambda t: t.get("alpha_30d") or -999, reverse=True)
-    headers = ["Politician","Ticker","Owner","Filed","Score","30d ret%","30d alpha%","90d ret%"]
+    headers = ["Politician","Ticker","Owner","Filed","Score","Power","Comm","30d ret%","30d alpha%","90d ret%"]
     rows = []
     for t in trades[:n]:
         rows.append([
@@ -484,6 +381,8 @@ def print_top_trades(res: dict, n: int = 15) -> None:
             t["owner"],
             t["filing_date"],
             t["score"],
+            t.get("power_pts", 0),
+            t.get("committee_pts", 0),
             f"{t.get('ret_30d',0) or 0:+.1f}%",
             f"{t.get('alpha_30d',0) or 0:+.1f}%",
             f"{t.get('ret_90d',0) or 0:+.1f}%",
@@ -588,7 +487,7 @@ def main() -> None:
 
     all_results = []
     for label, combo in combos_to_run.items():
-        print(f"  → {combo['desc']} ...")
+        print(f"  >> {combo['desc']} ...")
         res = run_backtest(buys, basket_scores, spy_prices, combo, label)
         all_results.append(res)
         n = len(res["trades"])
