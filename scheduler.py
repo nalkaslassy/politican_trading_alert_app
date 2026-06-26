@@ -190,14 +190,18 @@ def run_daily_pipeline(db, config) -> None:
 
 def start_scheduler(db, config) -> None:
     """Configure and start the blocking APScheduler with all jobs."""
+    from datetime import timedelta
     scheduler = BlockingScheduler(timezone=_TZ)
 
+    # misfire_grace_time=86400: if the machine was asleep at the scheduled time,
+    # run the job when it wakes — even hours later the same day.
     scheduler.add_job(
         run_performance_updater,
         CronTrigger(hour=8, minute=0, timezone=_TZ),
         args=[db],
         name="performance_updater",
         id="performance_updater",
+        misfire_grace_time=86400,
     )
 
     scheduler.add_job(
@@ -206,6 +210,7 @@ def start_scheduler(db, config) -> None:
         args=[db, config],
         name="daily_pipeline",
         id="daily_pipeline",
+        misfire_grace_time=86400,
     )
 
     scheduler.add_job(
@@ -214,7 +219,22 @@ def start_scheduler(db, config) -> None:
         args=[db, config],
         name="weekly_leaderboard",
         id="weekly_leaderboard",
+        misfire_grace_time=86400,
     )
+
+    # Startup catch-up: if today is a weekday and the process was just launched
+    # (machine rebooted, process crashed and BAT restarted), run the pipeline
+    # immediately. seen_trades deduplication ensures no double-alerts.
+    if datetime.now().weekday() < 5:  # 0=Mon … 4=Fri
+        scheduler.add_job(
+            run_daily_pipeline,
+            "date",
+            run_date=datetime.now() + timedelta(seconds=10),
+            args=[db, config],
+            name="startup_pipeline",
+            id="startup_pipeline",
+        )
+        logger.info("Startup catch-up pipeline scheduled (runs in 10s)")
 
     logger.info(
         "Scheduler starting — outcome_updater (daily 08:00), "
